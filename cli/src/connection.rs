@@ -389,16 +389,20 @@ pub fn get_port_for_session(session: &str) -> u16 {
     49152 + ((hash.unsigned_abs() as u32 % 16383) as u16)
 }
 
+/// The port the daemon wrote to the `.port` file once it was listening.
+#[cfg(windows)]
+fn written_port(session: &str) -> Option<u16> {
+    fs::read_to_string(get_port_path(session))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+}
+
 /// Read the actual daemon port from the `.port` file written by the daemon.
 /// Falls back to the hash-derived port if the file does not exist or is
 /// unreadable (e.g. daemon has not started yet).
 #[cfg(windows)]
 pub fn resolve_port(session: &str) -> u16 {
-    let port_path = get_port_path(session);
-    fs::read_to_string(&port_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or_else(|| get_port_for_session(session))
+    written_port(session).unwrap_or_else(|| get_port_for_session(session))
 }
 
 pub fn daemon_ready(session: &str) -> bool {
@@ -409,7 +413,12 @@ pub fn daemon_ready(session: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        let port = resolve_port(session);
+        // The hash-derived port is only where a daemon tries first. Another
+        // program may already listen there; that is not this session's
+        // daemon, which is known by the port it wrote.
+        let Some(port) = written_port(session) else {
+            return false;
+        };
         TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", port).parse().unwrap(),
             Duration::from_millis(50),
