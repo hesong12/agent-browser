@@ -1552,6 +1552,35 @@ mod tests {
         assert_ne!(namespaced_one, namespaced_two);
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn test_another_program_on_the_derived_port_is_not_the_sessions_daemon() {
+        let dir = std::env::temp_dir().join("ab-test-derived-port-taken");
+        let _ = fs::create_dir_all(&dir);
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let session = "derived-port-taken";
+        let _ = fs::remove_file(get_port_path(session));
+
+        // Another program already listens on the port this session's daemon
+        // would try first (when binding fails, something else holds it).
+        let _other = std::net::TcpListener::bind(("127.0.0.1", get_port_for_session(session)));
+        assert!(!daemon_ready(session));
+
+        // A daemon writes the port it listens on once it is listening.
+        let daemon = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fs::write(
+            get_port_path(session),
+            daemon.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        assert!(daemon_ready(session));
+
+        let _ = fs::remove_file(get_port_path(session));
+        let _ = fs::remove_dir(&dir);
+    }
+
     // === Daemon Version Mismatch Detection Tests ===
 
     #[test]
