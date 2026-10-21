@@ -4512,7 +4512,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Upload files through a file input.",
+      "description": "Upload files through a file input, or through the button or drop zone that opens a file chooser.",
       "inputSchema": {
         "properties": {
           "files": {
