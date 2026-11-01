@@ -14415,3 +14415,47 @@ async fn e2e_state_load_keeps_storage_away_from_page_scripts_and_redirects() {
     redirect_server.abort();
     hook_server.abort();
 }
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A collapsed search box that swaps in a new field the moment it is focused.
+    let html = concat!(
+        "data:text/html,<html><body><div id='host'><input id='old' placeholder='Search' ",
+        "onfocus=\"host.innerHTML='<input id=new placeholder=Search>';document.getElementById('new').focus()\">",
+        "</div></body></html>"
+    );
+    for action in ["fill", "type"] {
+        let resp = execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": html }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let key = if action == "fill" { "value" } else { "text" };
+        let resp = execute_command(
+            &json!({ "id": "3", "action": action, "selector": "#old", key: "query" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{action} claimed success: {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("replaced or unfocused"),
+            "{resp}"
+        );
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
