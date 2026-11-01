@@ -195,7 +195,7 @@ pub async fn fill(
                     this.dispatchEvent(new Event('input', { bubbles: true }));
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -215,7 +215,49 @@ pub async fn fill(
         )
         .await?;
 
-    Ok(())
+    ensure_text_reached(client, &effective_session_id, &object_id, selector_or_ref, value).await
+}
+
+/// Input.insertText and key events go to whatever the page has focused, not to
+/// the element that was asked for. A page may replace or blur an element the
+/// moment it is focused (a collapsed search box that swaps in a new field), so
+/// the text goes nowhere. Report that instead of success. An element the page
+/// blurs after accepting the text (a field that moves on after its last digit)
+/// still holds the text, so it counts as reached.
+async fn ensure_text_reached(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    selector_or_ref: &str,
+    text: &str,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function() {
+                    if (!this.isConnected) return false;
+                    if (this.getRootNode().activeElement === this) return true;
+                    return !!('value' in this ? this.value : this.textContent);
+                }"#
+                .to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: None,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    if result.result.value == Some(Value::Bool(true)) {
+        return Ok(());
+    }
+    Err(format!(
+        "The page replaced or unfocused {selector_or_ref} when it was focused, so the text did not go into that field. Take a new snapshot and check the field that is on the page now."
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -264,7 +306,7 @@ pub async fn type_text(
                         this.dispatchEvent(new Event('input', { bubbles: true }));
                     }"#
                     .to_string(),
-                    object_id: Some(object_id),
+                    object_id: Some(object_id.clone()),
                     arguments: None,
                     return_by_value: Some(true),
                     await_promise: Some(false),
@@ -274,7 +316,8 @@ pub async fn type_text(
             .await?;
     }
 
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    type_text_into_active_context(client, session_id, text, delay_ms).await?;
+    ensure_text_reached(client, &effective_session_id, &object_id, selector_or_ref, text).await
 }
 
 pub async fn type_text_into_active_context(
@@ -707,7 +750,7 @@ async fn js_click_checkbox(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: js.to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -740,7 +783,7 @@ pub async fn focus(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -779,7 +822,7 @@ pub async fn clear(
                     this.dispatchEvent(new Event('change', { bubbles: true }));
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -824,7 +867,7 @@ pub async fn select_all(
                     }
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -859,7 +902,7 @@ pub async fn scroll_into_view(
                 function_declaration:
                     "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }"
                         .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -904,7 +947,7 @@ pub async fn dispatch_event(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: js,
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -946,7 +989,7 @@ pub async fn highlight(
                     }, 3000);
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),

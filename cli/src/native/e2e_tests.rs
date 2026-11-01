@@ -16919,3 +16919,62 @@ async fn e2e_flow_a_route_limited_by_resource_type_applies_the_same_on_both_tier
     }
     let _ = exec(&run(&mut n, json!({ "action": "close" })), &mut state).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A collapsed search box that swaps in a new field the moment it is focused.
+    let html = concat!(
+        "data:text/html,<html><body><div id='host'><input id='old' placeholder='Search' ",
+        "onfocus=\"host.innerHTML='<input id=new placeholder=Search>';document.getElementById('new').focus()\">",
+        "</div></body></html>"
+    );
+    for action in ["fill", "type"] {
+        let resp = execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": html }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let key = if action == "fill" { "value" } else { "text" };
+        let resp = execute_command(
+            &json!({ "id": "3", "action": action, "selector": "#old", key: "query" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false, "{action} claimed success: {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("replaced or unfocused"),
+            "{resp}"
+        );
+    }
+
+    // A field that moves focus on once it has taken the text still holds it.
+    let blur = "data:text/html,<html><body><input id='otp' oninput='this.blur()'></body></html>";
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "navigate", "url": blur }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "fill", "selector": "#otp", "value": "7" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
