@@ -39,6 +39,10 @@ fn slow_find_click_keeps_the_daemon_reply() {
         "agent_browser_eval",
         json!({"session":"slow-reply", "script":"window.clicks"}),
     );
+    let timed_out = call(
+        "agent_browser_wait_ms",
+        json!({"session":"slow-reply", "ms":1000, "timeoutMs":100}),
+    );
     let closed = call("agent_browser_close", json!({"session":"slow-reply"}));
 
     assert_eq!(clicked["isError"], true, "{clicked}");
@@ -49,6 +53,11 @@ fn slow_find_click_keeps_the_daemon_reply() {
     assert_eq!(
         clicks["structuredContent"]["response"]["data"]["result"], 1,
         "{clicks}"
+    );
+    assert_eq!(timed_out["isError"], true, "{timed_out}");
+    assert!(
+        timed_out["structuredContent"]["exitCode"].is_null(),
+        "{timed_out}"
     );
     assert_eq!(closed["isError"], false, "{closed}");
 }
