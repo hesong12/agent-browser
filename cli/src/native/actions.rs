@@ -10849,6 +10849,37 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The names a miss saw, closest to the requested name first: those sharing
+/// more of its words lead, otherwise page order is kept. A page header's names
+/// come first in page order, so without this a long page shows only them.
+fn closest_names(target: &str, names: &[String]) -> String {
+    const SHOWN: usize = 20;
+    let words: Vec<String> = normalize_ws(target)
+        .to_lowercase()
+        .split(' ')
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut ranked: Vec<(usize, &String)> = names
+        .iter()
+        .map(|n| {
+            let name = normalize_ws(n).to_lowercase();
+            (words.iter().filter(|w| name.contains(w.as_str())).count(), n)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    let shown: Vec<String> = ranked
+        .iter()
+        .take(SHOWN)
+        .map(|(_, n)| format!("\"{}\"", n))
+        .collect();
+    if names.len() > SHOWN {
+        format!("{} (closest {} of {})", shown.join(", "), SHOWN, names.len())
+    } else {
+        shown.join(", ")
+    }
+}
+
 /// Match a role and (optional) accessible name against the AX tree, mirroring
 /// Playwright's getByRole semantics: role values are compared case-insensitively
 /// after AX-to-ARIA normalization; accessible names are whitespace-normalized on
@@ -10925,26 +10956,19 @@ fn find_ax_node_by_role(
     // typo'd name without a blind retry.
     if let Some(target_name) = name {
         if !names_seen.is_empty() {
-            let shown: Vec<String> = names_seen
-                .iter()
-                .take(5)
-                .map(|n| format!("\"{}\"", n))
-                .collect();
-            let more = if names_seen.len() > 5 { ", ..." } else { "" };
             let (plural, verb) = if role_match_count == 1 {
                 ("", "has")
             } else {
                 ("s", "have")
             };
             return Err(format!(
-                "{count} element{plural} {verb} role \"{role}\", but none match name \"{target_name}\". Names seen: {shown}{more}",
+                "{count} element{plural} {verb} role \"{role}\", but none match name \"{target_name}\". Names seen: {shown}",
                 count = role_match_count,
                 plural = plural,
                 verb = verb,
                 role = role,
                 target_name = target_name,
-                shown = shown.join(", "),
-                more = more,
+                shown = closest_names(target_name, &names_seen),
             ));
         }
     }
@@ -11008,7 +11032,10 @@ async fn handle_semantic_locator(
                     return matches(text);
                 }});
                 if (referenced) {{ referenced.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                return false;
+                const seen = Array.from(document.querySelectorAll('label')).map(el => el.textContent)
+                    .concat(Array.from(document.querySelectorAll('[aria-label]')).map(el => el.getAttribute('aria-label')))
+                    .map(t => (t || '').replace(/\s+/g, ' ').trim()).filter(t => t);
+                return Array.from(new Set(seen));
             }})()"#,
             )
         }
@@ -11075,14 +11102,21 @@ async fn handle_semantic_locator(
         )
         .await?;
 
-    if !result
-        .result
-        .value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(format!("No element found by {} '{}'", strategy, value));
+    let found = result.result.value.as_ref();
+    if !found.and_then(|v| v.as_bool()).unwrap_or(false) {
+        let seen: Vec<String> = found
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if seen.is_empty() {
+            return Err(format!("No element found by {} '{}'", strategy, value));
+        }
+        return Err(format!(
+            "No element found by {} '{}'. Labels seen: {}",
+            strategy,
+            value,
+            closest_names(value, &seen)
+        ));
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -15136,6 +15170,23 @@ mod tests {
         assert!(err.contains("Nope"));
         assert!(err.contains("\"Skills\""));
         assert!(err.contains("\"Experience\""));
+    }
+
+    #[test]
+    fn find_ax_node_by_role_name_miss_lists_closest_names_first() {
+        let mut nodes: Vec<_> = (0..30i64)
+            .map(|i| ax_node("button", &format!("Header {i}"), Some(i), false))
+            .collect();
+        nodes.push(ax_node("button", "Related Actions for Security", Some(100), false));
+
+        let err = find_ax_node_by_role(&nodes, "button", Some("Security Actions Menu"), false)
+            .expect_err("no button has that name");
+        assert!(
+            err.contains("Names seen: \"Related Actions for Security\", \"Header 0\""),
+            "the closest name must lead, then page order: {err}"
+        );
+        assert!(err.contains("(closest 20 of 31)"), "cap and total: {err}");
+        assert!(!err.contains("\"Header 19\""), "only 20 names are shown: {err}");
     }
 
     #[test]
