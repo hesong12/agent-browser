@@ -384,10 +384,14 @@ async fn resolve_center_in_same_process_frame(
     let y = value.and_then(|v| v.get("y")).and_then(|v| v.as_f64());
     match (x, y) {
         (Some(x), Some(y)) => Ok((x, y)),
-        _ => Err(format!(
-            "Element not found in the selected frame: {}",
-            selector
-        )),
+        _ => Err(selector_miss(
+            client,
+            Some(frame_id),
+            session_id,
+            format!("Element not found in the selected frame: {}", selector),
+            selector,
+        )
+        .await),
     }
 }
 
@@ -414,12 +418,21 @@ async fn resolve_object_in_same_process_frame(
             Some(session_id),
         )
         .await?;
-    result
+    match result
         .get("result")
         .and_then(|r| r.get("objectId"))
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
+    {
+        Some(object_id) => Ok(object_id.to_string()),
+        None => Err(selector_miss(
+            client,
+            Some(frame_id),
+            session_id,
+            format!("Element not found in the selected frame: {}", selector),
+            selector,
+        )
+        .await),
+    }
 }
 
 pub async fn resolve_element_center(
@@ -779,10 +792,16 @@ pub async fn resolve_element_object_id(
                     Some(frame_session.as_str()),
                 )
                 .await?;
-            let object_id = result
-                .result
-                .object_id
-                .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
+            let Some(object_id) = result.result.object_id else {
+                return Err(selector_miss(
+                    client,
+                    None,
+                    frame_session,
+                    format!("Element not found: {}", selector_or_ref),
+                    selector_or_ref,
+                )
+                .await);
+            };
             return Ok((object_id, frame_session.clone()));
         }
         let object_id =
@@ -804,10 +823,16 @@ pub async fn resolve_element_object_id(
         )
         .await?;
 
-    let object_id = result
-        .result
-        .object_id
-        .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
+    let Some(object_id) = result.result.object_id else {
+        return Err(selector_miss(
+            client,
+            None,
+            session_id,
+            format!("Element not found: {}", selector_or_ref),
+            selector_or_ref,
+        )
+        .await);
+    };
     Ok((object_id, session_id.to_string()))
 }
 
@@ -1097,8 +1122,37 @@ async fn resolve_by_selector(
 
     match (x, y) {
         (Some(x), Some(y)) => Ok((x, y)),
-        _ => Err(format!("Element not found: {}", selector)),
+        _ => Err(selector_miss(
+            client,
+            None,
+            session_id,
+            format!("Element not found: {}", selector),
+            selector,
+        )
+        .await),
     }
+}
+
+/// A selector miss with the page's selectors closest to the one asked for.
+/// `frame_id` is a same-process frame under `session_id`; a cross-process
+/// frame is its own session.
+pub(super) async fn selector_miss(
+    client: &CdpClient,
+    frame_id: Option<&str>,
+    session_id: &str,
+    miss: String,
+    selector: &str,
+) -> String {
+    super::actions::with_seen(
+        client,
+        frame_id,
+        session_id,
+        &HashMap::new(),
+        miss,
+        selector,
+        super::actions::PAGE_SELECTORS,
+    )
+    .await
 }
 
 fn intercepted_error(target: &str, blocker: &str) -> String {

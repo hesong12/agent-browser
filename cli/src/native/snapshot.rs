@@ -6,7 +6,7 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AXNode, AXProperty, AXValue, EvaluateParams, EvaluateResult, GetFullAXTreeResult,
 };
-use super::element::{resolve_ax_session, RefMap};
+use super::element::{resolve_ax_session, selector_miss, RefMap};
 
 #[cfg(test)]
 mod document_identity_regressions {
@@ -366,13 +366,19 @@ pub async fn take_snapshot(
                     .unwrap_or(exception.text);
                 return Err(format!("Invalid selector '{}': {}", selector, detail));
             }
-            if result.result.subtype.as_deref() != Some("node") {
-                return Err(format!("Selector '{}' did not match any element", selector));
-            }
-            let object_id = result
-                .result
-                .object_id
-                .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
+            let object_id = match result.result.object_id {
+                Some(object_id) if result.result.subtype.as_deref() == Some("node") => object_id,
+                _ => {
+                    return Err(selector_miss(
+                        client,
+                        None,
+                        session_id,
+                        format!("Selector '{}' did not match any element", selector),
+                        selector,
+                    )
+                    .await)
+                }
+            };
 
             // Request the full DOM subtree (depth: -1), including shadow roots
             // (pierce), so we can collect all backendNodeIds that live under
@@ -465,10 +471,18 @@ pub async fn take_snapshot(
             .collect();
 
         if roots.is_empty() {
-            return Err(format!(
-                "No accessibility node found for selector '{}'",
-                options.selector.as_deref().unwrap_or("")
-            ));
+            let selector = options.selector.as_deref().unwrap_or("");
+            return Err(selector_miss(
+                client,
+                None,
+                session_id,
+                format!(
+                    "Selector '{}' matched an element with nothing accessible in it",
+                    selector
+                ),
+                selector,
+            )
+            .await);
         }
         roots
     } else {

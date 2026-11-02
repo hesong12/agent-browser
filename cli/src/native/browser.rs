@@ -246,6 +246,11 @@ pub fn to_ai_friendly_error(error: &str) -> String {
             "{detail}. Verify the selector, role, or name is correct and the element exists in the DOM."
         );
     }
+    // A miss that lists what the page has is already the answer; the broad
+    // checks below would replace that list with generic advice.
+    if lower.contains(" seen: ") {
+        return error.to_string();
+    }
     if lower.contains("strict mode violation") {
         return "Element matched multiple results. Use a more specific selector.".to_string();
     }
