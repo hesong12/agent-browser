@@ -3422,6 +3422,65 @@ async fn e2e_wait() {
     assert_success(&resp);
 }
 
+// A text miss and a text wait timeout list the page's visible texts closest to
+// the requested one, so the caller can correct the text instead of guessing.
+#[tokio::test]
+#[ignore]
+async fn e2e_text_miss_and_wait_timeout_list_closest_texts() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<html><body>",
+        "<div>Home</div><div>Skip to main content</div>",
+        "<div>Maintain Permissions for Security Group</div>",
+        "<div style='display:none'>Hidden Security Text</div>",
+        "</body></html>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "getbytext", "text": "Edit Security Policy Permissions", "subaction": "click", "exact": true }),
+        &mut state,
+    )
+    .await;
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("Texts seen: \"Maintain Permissions for Security Group\", \"Home\""),
+        "the closest visible text must lead: {err}"
+    );
+    assert!(
+        !err.contains("Hidden Security Text"),
+        "only visible text: {err}"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "wait", "text": "Security Policy", "timeout": 200 }),
+        &mut state,
+    )
+    .await;
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.starts_with(
+            "Wait timed out after 200ms. Texts seen: \"Maintain Permissions for Security Group\""
+        ),
+        "a text wait timeout lists the closest texts: {err}"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // wait --load on a page that already finished loading must resolve
 // immediately instead of waiting for a Page.loadEventFired that will never
 // come (the common case after a click that triggers an SPA navigation).

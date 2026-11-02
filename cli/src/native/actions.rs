@@ -7834,7 +7834,47 @@ async fn wait_for_text(
         "(document.body.innerText || '').includes({})",
         serde_json::to_string(text).unwrap_or_default()
     );
-    poll_until_true(client, session_id, &check_fn, timeout_ms).await
+    let Err(err) = poll_until_true(client, session_id, &check_fn, timeout_ms).await else {
+        return Ok(());
+    };
+    let result: Result<super::cdp::types::EvaluateResult, String> = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: format!("({})", VISIBLE_TEXTS_JS),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await;
+    let seen = result
+        .ok()
+        .map(|r| string_array(r.result.value.as_ref()))
+        .unwrap_or_default();
+    if seen.is_empty() {
+        return Err(err);
+    }
+    Err(format!(
+        "{}. Texts seen: {}",
+        err,
+        closest_names(text, &seen)
+    ))
+}
+
+/// The page's visible text lines, unique, in page order: what a text miss or a
+/// text wait timeout reports, so the caller can correct the text it asked for.
+const VISIBLE_TEXTS_JS: &str = "Array.from(new Set((document.body.innerText || '').split('\\n').map(t => t.replace(/\\s+/g, ' ').trim()).filter(t => t)))";
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn wait_for_function(
@@ -11412,7 +11452,10 @@ fn closest_names(target: &str, names: &[String]) -> String {
         .iter()
         .map(|n| {
             let name = normalize_ws(n).to_lowercase();
-            (words.iter().filter(|w| name.contains(w.as_str())).count(), n)
+            (
+                words.iter().filter(|w| name.contains(w.as_str())).count(),
+                n,
+            )
         })
         .collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0));
@@ -11422,7 +11465,12 @@ fn closest_names(target: &str, names: &[String]) -> String {
         .map(|(_, n)| format!("\"{}\"", n))
         .collect();
     if names.len() > SHOWN {
-        format!("{} (closest {} of {})", shown.join(", "), SHOWN, names.len())
+        format!(
+            "{} (closest {} of {})",
+            shown.join(", "),
+            SHOWN,
+            names.len()
+        )
     } else {
         shown.join(", ")
     }
@@ -11630,9 +11678,10 @@ async fn handle_semantic_locator(
                             return true;
                         }}
                     }}
-                    return false;
+                    return {visible_texts};
                 }})()"#,
                 match_fn = match_fn,
+                visible_texts = VISIBLE_TEXTS_JS,
             )
         }
     };
@@ -11652,17 +11701,20 @@ async fn handle_semantic_locator(
 
     let found = result.result.value.as_ref();
     if !found.and_then(|v| v.as_bool()).unwrap_or(false) {
-        let seen: Vec<String> = found
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
+        let seen = string_array(found);
         if seen.is_empty() {
             return Err(format!("No element found by {} '{}'", strategy, value));
         }
+        let kind = if strategy == "label" {
+            "Labels"
+        } else {
+            "Texts"
+        };
         return Err(format!(
-            "No element found by {} '{}'. Labels seen: {}",
+            "No element found by {} '{}'. {} seen: {}",
             strategy,
             value,
+            kind,
             closest_names(value, &seen)
         ));
     }
@@ -16683,7 +16735,12 @@ mod tests {
         let mut nodes: Vec<_> = (0..30i64)
             .map(|i| ax_node("button", &format!("Header {i}"), Some(i), false))
             .collect();
-        nodes.push(ax_node("button", "Related Actions for Security", Some(100), false));
+        nodes.push(ax_node(
+            "button",
+            "Related Actions for Security",
+            Some(100),
+            false,
+        ));
 
         let err = find_ax_node_by_role(&nodes, "button", Some("Security Actions Menu"), false)
             .expect_err("no button has that name");
@@ -16692,7 +16749,10 @@ mod tests {
             "the closest name must lead, then page order: {err}"
         );
         assert!(err.contains("(closest 20 of 31)"), "cap and total: {err}");
-        assert!(!err.contains("\"Header 19\""), "only 20 names are shown: {err}");
+        assert!(
+            !err.contains("\"Header 19\""),
+            "only 20 names are shown: {err}"
+        );
     }
 
     #[test]
