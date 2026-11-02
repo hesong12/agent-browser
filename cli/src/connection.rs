@@ -823,7 +823,9 @@ fn request_graceful_daemon_shutdown(session: &str) -> bool {
         "action": INTERNAL_DAEMON_SHUTDOWN_ACTION
     });
 
-    match send_command(close_cmd, session) {
+    match send_with_retry(false, || {
+        send_command_once(&close_cmd, session, Some(Duration::from_secs(30)))
+    }) {
         Ok(resp) if resp.success => wait_for_daemon_exit(session, Duration::from_secs(5)),
         _ => false,
     }
@@ -1116,7 +1118,9 @@ fn is_read_only(cmd: &Value) -> bool {
 }
 
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    send_with_retry(is_read_only(&cmd), || send_command_once(&cmd, session))
+    send_with_retry(is_read_only(&cmd), || {
+        send_command_once(&cmd, session, None)
+    })
 }
 
 /// Retry transient errors (EAGAIN/EWOULDBLOCK/connection issues). Once a
@@ -1206,34 +1210,20 @@ fn has_os_error(error: &str, code: u32) -> bool {
     error.contains(&format!("(os error {})", code))
 }
 
-/// Socket read timeout for one request. Ordinary commands get a 30s floor.
-/// Commands carrying an operation timeout (the wait family, which
-/// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
-/// --timeout is given) get that timeout plus margin, so the daemon can report
-/// a proper operation timeout instead of the client dying with EAGAIN at 30s
-/// and a mutating command failing with outcome_unknown while it still runs.
-///
-/// The env var is deliberately NOT consulted here. Reading it would apply a
-/// long wait budget to every command, so a genuinely hung daemon on a simple
-/// `url`/`title`/`snapshot` call would take the full budget to surface
-/// instead of 30s. Only commands that actually carry a `timeout` field get
-/// the extended budget, and that field is set client-side per invocation,
-/// avoiding the daemon's spawn-time env snapshot drifting from the client.
-pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
-    let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
-    if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
-        op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
-    }
-    Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
-}
-
-fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError> {
+fn send_command_once(
+    cmd: &Value,
+    session: &str,
+    read_timeout: Option<Duration>,
+) -> Result<Response, SendError> {
     let mut json_str = serde_json::to_string(cmd).map_err(|e| SendError::NotSent(e.to_string()))?;
     json_str.push('\n');
 
     let stream = connect(session).map_err(SendError::NotSent)?;
 
-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
+    // The daemon owns operation/CDP deadlines and returns their result, including
+    // timeout diagnosis. Only the shutdown caller bounds its control request;
+    // normal commands keep the reply. MCP bounds the CLI process in run_command.
+    stream.set_read_timeout(read_timeout).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     exchange(stream, json_str.as_bytes())
@@ -1480,14 +1470,6 @@ mod tests {
         assert!(!is_read_only(&json!({"action": "evaluate"})));
         assert!(!is_read_only(&json!({"action": "some_future_action"})));
         assert!(!is_read_only(&json!({})));
-    }
-
-    #[test]
-    fn long_mouse_movement_gets_its_requested_time_budget() {
-        assert_eq!(
-            read_timeout_for(&json!({"action":"mousemove", "duration": 35_000})),
-            Duration::from_secs(45)
-        );
     }
 
     #[test]

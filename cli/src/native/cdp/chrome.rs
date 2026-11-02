@@ -1235,9 +1235,7 @@ async fn resolve_cdp_from_active_port_within(
 
 /// How long `--auto-connect` keeps the direct WebSocket handshake open.
 /// Chrome 144+ holds the handshake while it shows the remote-debugging
-/// permission prompt, so this must leave time to approve it (#1365). It stays
-/// below the client's 30s read timeout (`connection::read_timeout_for`) so the
-/// daemon answers before the client gives up and retries.
+/// permission prompt, so this must leave time to approve it (#1365).
 const AUTO_CONNECT_WS_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 
 enum WsVerify {
@@ -3060,11 +3058,5 @@ exec sleep 60
             !server.await.unwrap(),
             "HTTP discovery must not run while the prompt is open"
         );
-    }
-
-    #[test]
-    fn auto_connect_wait_stays_below_client_read_timeout() {
-        let client_floor = crate::connection::read_timeout_for(&serde_json::json!({}));
-        assert!(AUTO_CONNECT_WS_VERIFY_TIMEOUT < client_floor);
     }
 }
