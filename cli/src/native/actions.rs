@@ -7804,7 +7804,12 @@ async fn wait_for_selector(
         ),
     };
 
-    poll_until_true(client, session_id, &check_fn, timeout_ms).await
+    match poll_until_true(client, session_id, &check_fn, timeout_ms).await {
+        Err(err) if state != "detached" && state != "hidden" => {
+            Err(super::element::selector_miss(client, None, session_id, err, selector).await)
+        }
+        waited => waited,
+    }
 }
 
 async fn wait_for_url(mgr: &BrowserManager, pattern: &str, timeout_ms: u64) -> Result<(), String> {
@@ -7837,34 +7842,77 @@ async fn wait_for_text(
     let Err(err) = poll_until_true(client, session_id, &check_fn, timeout_ms).await else {
         return Ok(());
     };
-    let result: Result<super::cdp::types::EvaluateResult, String> = client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: format!("({})", VISIBLE_TEXTS_JS),
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(session_id),
-        )
-        .await;
-    let seen = result
-        .ok()
-        .map(|r| string_array(r.result.value.as_ref()))
-        .unwrap_or_default();
-    if seen.is_empty() {
-        return Err(err);
-    }
-    Err(format!(
-        "{}. Texts seen: {}",
+    Err(with_seen(
+        client,
+        None,
+        session_id,
+        &HashMap::new(),
         err,
-        closest_names(text, &seen)
-    ))
+        text,
+        PAGE_TEXTS,
+    )
+    .await)
 }
 
-/// The page's visible text lines, unique, in page order: what a text miss or a
-/// text wait timeout reports, so the caller can correct the text it asked for.
-const VISIBLE_TEXTS_JS: &str = "Array.from(new Set((document.body.innerText || '').split('\\n').map(t => t.replace(/\\s+/g, ' ').trim()).filter(t => t)))";
+/// What a locator miss or timeout reports about the page: `miss`, then the
+/// page's entries of `kind` closest to `target` (20 with the total), read by
+/// `list_fn` (`(doc) => string[]`) in the document the locator looked in. Every
+/// miss on a selector, text, label, role or attribute the caller supplied goes
+/// through here, so the caller can correct its guess instead of guessing again.
+pub(super) async fn with_seen(
+    client: &super::cdp::client::CdpClient,
+    frame_id: Option<&str>,
+    session_id: &str,
+    iframe_sessions: &HashMap<String, String>,
+    miss: String,
+    target: &str,
+    (kind, list_fn): (&str, &str),
+) -> String {
+    let body = format!(
+        r#"(doc) => Array.from(new Set(({list_fn})(doc).map(t => (t || '').replace(/\s+/g, ' ').trim()).filter(t => t)))"#
+    );
+    let seen = eval_body_in_active_frame(client, frame_id, session_id, iframe_sessions, &body)
+        .await
+        .map(|v| string_array(Some(&v)))
+        .unwrap_or_default();
+    if seen.is_empty() {
+        return miss;
+    }
+    format!(
+        "{}. {} seen: {}",
+        miss.trim_end_matches('.'),
+        kind,
+        closest_names(target, &seen)
+    )
+}
+
+/// The page's visible text lines.
+pub(super) const PAGE_TEXTS: (&str, &str) = (
+    "Texts",
+    r#"(doc) => (doc.body ? doc.body.innerText : '').split('\n')"#,
+);
+
+/// Selectors that identify the page's rendered elements: ids, roles, names,
+/// aria-labels and data attributes.
+pub(super) const PAGE_SELECTORS: (&str, &str) = (
+    "Selectors",
+    r#"(doc) => Array.from(doc.querySelectorAll('*')).filter(el => el.getClientRects().length).flatMap(el =>
+        (el.id ? ['#' + CSS.escape(el.id)] : []).concat(Array.from(el.attributes)
+            .filter(a => a.value && a.value.length <= 100 && (['role', 'name', 'aria-label'].includes(a.name) || (a.name.startsWith('data-') && a.name !== 'data-agent-browser-located')))
+            .map(a => '[' + a.name + '=' + JSON.stringify(a.value) + ']')))"#,
+);
+
+/// The page's labels and aria-labels.
+const PAGE_LABELS: (&str, &str) = (
+    "Labels",
+    r#"(doc) => Array.from(doc.querySelectorAll('label'), el => el.textContent).concat(Array.from(doc.querySelectorAll('[aria-label]'), el => el.getAttribute('aria-label')))"#,
+);
+
+/// The explicit roles on the page.
+const PAGE_ROLES: (&str, &str) = (
+    "Roles",
+    r#"(doc) => Array.from(doc.querySelectorAll('[role]'), el => el.getAttribute('role'))"#,
+);
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
     value
@@ -7947,7 +7995,18 @@ async fn wait_for_selector_in_frame(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Wait timed out after {}ms", timeout_ms));
+            let err = format!("Wait timed out after {}ms", timeout_ms);
+            if state == "detached" || state == "hidden" {
+                return Err(err);
+            }
+            return Err(super::element::selector_miss(
+                client,
+                Some(frame_id),
+                session_id,
+                err,
+                selector,
+            )
+            .await);
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
@@ -10984,7 +11043,17 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             serde_json::to_string(sel).unwrap_or_default()
         );
         let result = mgr.evaluate(&js, None).await?;
-        let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
+        let Some(frame_name) = result.as_str() else {
+            let session_id = mgr.active_session_id()?;
+            return Err(super::element::selector_miss(
+                &mgr.client,
+                None,
+                session_id,
+                format!("Could not find frame for selector '{sel}'"),
+                sel,
+            )
+            .await);
+        };
         if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
             state.active_frame_id = Some(frame_id);
             return Ok(json!({ "frame": frame_name }));
@@ -11262,24 +11331,31 @@ async fn handle_presentational_getbyrole(
         }}"#
     );
 
-    let located = {
-        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-        let top_session = mgr.active_session_id()?.to_string();
-        eval_body_in_active_frame(
-            mgr,
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let top_session = mgr.active_session_id()?.to_string();
+    let located = eval_body_in_active_frame(
+        &mgr.client,
+        state.active_frame_id.as_deref(),
+        &top_session,
+        &state.iframe_sessions,
+        &locate_body,
+    )
+    .await?;
+
+    if !located.as_bool().unwrap_or(false) {
+        return Err(with_seen(
+            &mgr.client,
             state.active_frame_id.as_deref(),
             &top_session,
             &state.iframe_sessions,
-            &locate_body,
+            format!(
+                "No element found: {}",
+                build_role_selector(role, name, exact)
+            ),
+            role,
+            PAGE_ROLES,
         )
-        .await?
-    };
-
-    if !located.as_bool().unwrap_or(false) {
-        return Err(format!(
-            "No element found: {}",
-            build_role_selector(role, name, exact)
-        ));
+        .await);
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -11290,7 +11366,7 @@ async fn handle_presentational_getbyrole(
         if let Ok(top_session) = mgr.active_session_id() {
             let top_session = top_session.to_string();
             let _ = eval_body_in_active_frame(
-                mgr,
+                &mgr.client,
                 state.active_frame_id.as_deref(),
                 &top_session,
                 &state.iframe_sessions,
@@ -11309,7 +11385,7 @@ async fn handle_presentational_getbyrole(
 /// contentDocument (as element resolution does); an OOPIF has its own session
 /// where `document` is already the frame document.
 async fn eval_body_in_active_frame(
-    mgr: &BrowserManager,
+    client: &super::cdp::client::CdpClient,
     frame_id: Option<&str>,
     top_session: &str,
     iframe_sessions: &HashMap<String, String>,
@@ -11317,13 +11393,11 @@ async fn eval_body_in_active_frame(
 ) -> Result<Value, String> {
     match frame_id {
         Some(fid) if !iframe_sessions.contains_key(fid) => {
-            let owner =
-                super::element::frame_owner_object_id(&mgr.client, top_session, fid).await?;
+            let owner = super::element::frame_owner_object_id(client, top_session, fid).await?;
             let func = format!(
                 "function() {{ const d = this.contentDocument; if (!d) return null; return ({body})(d); }}"
             );
-            let res = mgr
-                .client
+            let res = client
                 .send_command(
                     "Runtime.callFunctionOn",
                     Some(serde_json::json!({
@@ -11345,8 +11419,7 @@ async fn eval_body_in_active_frame(
                 .and_then(|f| iframe_sessions.get(f))
                 .map(|s| s.as_str())
                 .unwrap_or(top_session);
-            let res: super::cdp::types::EvaluateResult = mgr
-                .client
+            let res: super::cdp::types::EvaluateResult = client
                 .send_command_typed(
                     "Runtime.evaluate",
                     &super::cdp::types::EvaluateParams {
@@ -11440,14 +11513,25 @@ fn normalize_ws(s: &str) -> String {
 /// The names a miss saw, closest to the requested name first: those sharing
 /// more of its words lead, otherwise page order is kept. A page header's names
 /// come first in page order, so without this a long page shows only them.
+/// Words split at punctuation and camelCase too, so a guessed selector such as
+/// `[data-id="relatedActionsMenu"]` ranks the page's `relatedActions…` first.
 fn closest_names(target: &str, names: &[String]) -> String {
     const SHOWN: usize = 20;
-    let words: Vec<String> = normalize_ws(target)
-        .to_lowercase()
-        .split(' ')
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in target.chars().chain(std::iter::once(' ')) {
+        if !c.is_alphanumeric() || (prev_lower && c.is_uppercase()) {
+            if word.chars().count() > 1 && !words.contains(&word) {
+                words.push(word.clone());
+            }
+            word.clear();
+        }
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+        }
+        prev_lower = c.is_lowercase() || c.is_numeric();
+    }
     let mut ranked: Vec<(usize, &String)> = names
         .iter()
         .map(|n| {
@@ -11497,6 +11581,7 @@ fn find_ax_node_by_role(
     let mut names_set: HashSet<String> = HashSet::new();
     let mut role_match_count: usize = 0;
     let target_role = normalize_ax_role(role);
+    let mut roles_seen: Vec<String> = Vec::new();
 
     for node in nodes {
         if node.ignored.unwrap_or(false) {
@@ -11504,7 +11589,11 @@ fn find_ax_node_by_role(
         }
 
         let node_role = super::element::extract_ax_string(&node.role);
-        if normalize_ax_role(&node_role) != target_role {
+        let normalized = normalize_ax_role(&node_role);
+        if normalized != target_role {
+            if !normalized.is_empty() && !roles_seen.contains(&normalized) {
+                roles_seen.push(normalized);
+            }
             continue;
         }
 
@@ -11570,6 +11659,13 @@ fn find_ax_node_by_role(
     }
 
     let desc = build_role_selector(role, name, exact);
+    if role_match_count == 0 && !roles_seen.is_empty() {
+        return Err(format!(
+            "No element found: {}. Roles seen: {}",
+            desc,
+            closest_names(role, &roles_seen)
+        ));
+    }
     Err(format!("No element found: {}", desc))
 }
 
@@ -11628,10 +11724,7 @@ async fn handle_semantic_locator(
                     return matches(text);
                 }});
                 if (referenced) {{ referenced.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                const seen = Array.from(document.querySelectorAll('label')).map(el => el.textContent)
-                    .concat(Array.from(document.querySelectorAll('[aria-label]')).map(el => el.getAttribute('aria-label')))
-                    .map(t => (t || '').replace(/\s+/g, ' ').trim()).filter(t => t);
-                return Array.from(new Set(seen));
+                return false;
             }})()"#,
             )
         }
@@ -11678,10 +11771,9 @@ async fn handle_semantic_locator(
                             return true;
                         }}
                     }}
-                    return {visible_texts};
+                    return false;
                 }})()"#,
                 match_fn = match_fn,
-                visible_texts = VISIBLE_TEXTS_JS,
             )
         }
     };
@@ -11699,24 +11791,37 @@ async fn handle_semantic_locator(
         )
         .await?;
 
-    let found = result.result.value.as_ref();
-    if !found.and_then(|v| v.as_bool()).unwrap_or(false) {
-        let seen = string_array(found);
-        if seen.is_empty() {
-            return Err(format!("No element found by {} '{}'", strategy, value));
-        }
-        let kind = if strategy == "label" {
-            "Labels"
-        } else {
-            "Texts"
+    if !result
+        .result
+        .value
+        .as_ref()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let attribute_values = |kind, attr| {
+            (
+                kind,
+                format!("(doc) => Array.from(doc.querySelectorAll('[{attr}]'), el => el.getAttribute('{attr}'))"),
+            )
         };
-        return Err(format!(
-            "No element found by {} '{}'. {} seen: {}",
-            strategy,
+        let (kind, list_fn) = match strategy {
+            "label" => (PAGE_LABELS.0, PAGE_LABELS.1.to_string()),
+            "placeholder" => attribute_values("Placeholders", "placeholder"),
+            "alttext" => attribute_values("Alt texts", "alt"),
+            "title" => attribute_values("Titles", "title"),
+            "testid" => attribute_values("Test ids", "data-testid"),
+            _ => (PAGE_TEXTS.0, PAGE_TEXTS.1.to_string()),
+        };
+        return Err(with_seen(
+            &mgr.client,
+            None,
+            &session_id,
+            &HashMap::new(),
+            format!("No element found by {} '{}'", strategy, value),
             value,
-            kind,
-            closest_names(value, &seen)
-        ));
+            (kind, &list_fn),
+        )
+        .await);
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -11802,10 +11907,14 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        return Err(format!(
-            "No element at index {} for selector '{}'",
-            index, selector
-        ));
+        return Err(super::element::selector_miss(
+            &mgr.client,
+            None,
+            &session_id,
+            format!("No element at index {} for selector '{}'", index, selector),
+            selector,
+        )
+        .await);
     }
 
     let located = "[data-agent-browser-located='true']";
@@ -12057,7 +12166,15 @@ async fn handle_multiselect(cmd: &Value, state: &DaemonState) -> Result<Value, S
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        return Err(format!("No element found: {selector}"));
+        let session_id = mgr.active_session_id()?;
+        return Err(super::element::selector_miss(
+            &mgr.client,
+            None,
+            session_id,
+            format!("No element found: {selector}"),
+            selector,
+        )
+        .await);
     }
     let selected = result.get("selected").cloned().unwrap_or_else(|| json!([]));
     Ok(json!({ "selected": selected }))

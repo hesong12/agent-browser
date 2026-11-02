@@ -3481,6 +3481,102 @@ async fn e2e_text_miss_and_wait_timeout_list_closest_texts() {
     assert_success(&resp);
 }
 
+// A guessed selector that is not on the page (snapshot, click, fill, get text,
+// wait) lists the page's selectors closest to it, and a role or placeholder
+// miss lists the roles or placeholders seen, so the caller can correct it.
+#[tokio::test]
+#[ignore]
+async fn e2e_selector_misses_list_closest_selectors() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<html><body>",
+        "<div data-automation-id='pageHeader'>Home</div>",
+        "<div role='main'><button data-automation-id='relatedActionsButton'>Related</button>",
+        "<input placeholder='Search Workers'></div>",
+        "<div data-automation-id='relatedActionsHidden' style='display:none'></div>",
+        "</body></html>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let guessed = "[data-automation-id=\"relatedActionsContainer\"]";
+    for (id, cmd) in [
+        ("3", json!({ "action": "snapshot", "selector": "main" })),
+        ("4", json!({ "action": "snapshot", "selector": guessed })),
+        ("5", json!({ "action": "click", "selector": guessed })),
+        (
+            "6",
+            json!({ "action": "fill", "selector": guessed, "value": "x" }),
+        ),
+        ("7", json!({ "action": "gettext", "selector": guessed })),
+        (
+            "8",
+            json!({ "action": "wait", "selector": guessed, "timeout": 200 }),
+        ),
+    ] {
+        let mut cmd = cmd;
+        cmd["id"] = json!(id);
+        let resp = execute_command(&cmd, &mut state).await;
+        let err = resp["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("Selectors seen: "),
+            "{id}: lists selectors: {err}"
+        );
+        assert!(
+            !err.contains("relatedActionsHidden"),
+            "{id}: only rendered elements: {err}"
+        );
+        if id == "3" {
+            assert!(
+                err.contains("Selectors seen: \"[role=\"main\"]\""),
+                "the closest selector leads: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("Selectors seen: \"[data-automation-id=\"relatedActionsButton\"]\""),
+                "the closest selector leads: {err}"
+            );
+        }
+    }
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "getbyrole", "role": "menu", "subaction": "click" }),
+        &mut state,
+    )
+    .await;
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("Roles seen: "),
+        "a role miss lists roles: {err}"
+    );
+    assert!(err.contains("\"button\""), "roles on the page: {err}");
+
+    let resp = execute_command(
+        &json!({ "id": "10", "action": "getbyplaceholder", "placeholder": "Search", "subaction": "click" }),
+        &mut state,
+    )
+    .await;
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("Placeholders seen: \"Search Workers\""),
+        "a placeholder miss lists placeholders: {err}"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // wait --load on a page that already finished loading must resolve
 // immediately instead of waiting for a Page.loadEventFired that will never
 // come (the common case after a click that triggers an SPA navigation).
