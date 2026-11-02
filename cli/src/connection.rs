@@ -635,7 +635,6 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     opts.debug.hash(&mut hasher);
     opts.action_policy.hash(&mut hasher);
     opts.confirm_actions.hash(&mut hasher);
-    opts.idle_timeout.hash(&mut hasher);
     opts.default_timeout.hash(&mut hasher);
     opts.no_auto_dialog.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -1637,9 +1636,10 @@ mod tests {
         let dialog_changed = test_daemon_options(None, true, None);
         let domains_changed = test_daemon_options(None, false, Some(&domains));
 
-        assert_ne!(
+        assert_eq!(
             daemon_config_fingerprint(&base),
-            daemon_config_fingerprint(&idle_changed)
+            daemon_config_fingerprint(&idle_changed),
+            "an idle timeout only decides when an idle daemon exits; changing it must not restart the daemon and close its browser"
         );
         assert_ne!(
             daemon_config_fingerprint(&base),
@@ -1660,8 +1660,8 @@ mod tests {
         guard.remove("AGENT_BROWSER_NAMESPACE");
 
         let session = "race-config";
-        let winner_opts = test_daemon_options(Some("1000"), false, None);
-        let loser_opts = test_daemon_options(Some("2000"), false, None);
+        let winner_opts = test_daemon_options(None, false, None);
+        let loser_opts = test_daemon_options(None, true, None);
 
         fs::create_dir_all(get_socket_dir()).unwrap();
         fs::write(get_pid_path(session), "12345").unwrap();
