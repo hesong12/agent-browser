@@ -645,6 +645,12 @@ pub fn save_screenshot(base64_data: &str, options: &ScreenshotOptions) -> Result
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data)
         .map_err(|e| format!("Failed to decode screenshot: {}", e))?;
 
+    // An explicit path may name a folder that does not exist yet; the file
+    // writing tools of agents create the folders of a path they are given.
+    if let Some(parent) = std::path::Path::new(&save_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to save screenshot to {}: {}", save_path, e))?;
+    }
     std::fs::write(&save_path, &bytes)
         .map_err(|e| format!("Failed to save screenshot to {}: {}", save_path, e))?;
 
@@ -668,6 +674,20 @@ fn get_screenshot_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_path_in_a_new_folder_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new").join("run").join("shot.png");
+        let options = ScreenshotOptions {
+            path: Some(path.to_string_lossy().to_string()),
+            ..ScreenshotOptions::default()
+        };
+
+        save_screenshot("aGk=", &options).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"hi");
+    }
 
     #[test]
     fn selector_screenshots_capture_beyond_the_initial_viewport() {

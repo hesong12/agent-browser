@@ -9238,6 +9238,9 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
 
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
         .map_err(|e| format!("Failed to decode PDF: {}", e))?;
+    if let Some(parent) = std::path::Path::new(&save_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to save PDF: {}", e))?;
+    }
     std::fs::write(&save_path, &bytes).map_err(|e| format!("Failed to save PDF: {}", e))?;
 
     Ok(json!({ "path": save_path }))
