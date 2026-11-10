@@ -199,6 +199,15 @@ async fn install_domain_filter_runtime_script(
         return Ok(());
     }
 
+    // An auto-attached target paused before its first document has no
+    // context to patch; the new-document script installed just before covers
+    // that document. Chrome 157 holds Runtime.evaluate on such a target until
+    // it resumes (earlier versions answered "Cannot find default execution
+    // context"), so evaluating there would wait out the command timeout.
+    if paused_before_document {
+        return Ok(());
+    }
+
     let script = domain_filter_script(allowed_domains);
     let evaluation = match client
         .send_command(
