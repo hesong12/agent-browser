@@ -17136,7 +17136,7 @@ async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
 
 #[tokio::test]
 #[ignore]
-async fn e2e_fill_and_type_recognize_text_delivered_to_equivalent_replacement() {
+async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
     let mut state = DaemonState::new();
     assert_success(
         &execute_command(
@@ -17153,6 +17153,7 @@ async fn e2e_fill_and_type_recognize_text_delivered_to_equivalent_replacement() 
             "different-type",
             "duplicate-id",
             "no-input",
+            "prefilled-blocked",
         ] {
             assert_success(
                 &execute_command(
@@ -17165,13 +17166,14 @@ async fn e2e_fill_and_type_recognize_text_delivered_to_equivalent_replacement() 
                 r#"(() => {{
                 document.body.innerHTML = '<input id="search" role="combobox" aria-label="Search" name="query">';
                 const original = document.getElementById('search');
+                if ('{variant}' === 'prefilled-blocked') original.value = 'query';
                 original.onfocus = () => {{
                     const replacement = original.cloneNode(true);
                     original.replaceWith(replacement);
                     if ('{variant}' === 'different-label') replacement.setAttribute('aria-label', 'Other');
                     if ('{variant}' === 'different-type') replacement.type = 'password';
                     if ('{variant}' === 'duplicate-id') document.body.append(replacement.cloneNode(true));
-                    if ('{variant}' === 'no-input') replacement.onbeforeinput = event => event.preventDefault();
+                    if (['no-input', 'prefilled-blocked'].includes('{variant}')) replacement.onbeforeinput = event => event.preventDefault();
                     replacement.focus();
                 }};
             }})()"#
@@ -17202,7 +17204,7 @@ async fn e2e_fill_and_type_recognize_text_delivered_to_equivalent_replacement() 
             .await;
             assert_eq!(
                 result["success"],
-                variant == "equivalent",
+                action == "fill" && ["equivalent", "prefilled-blocked"].contains(&variant),
                 "{action} / {variant}: {result}"
             );
         }
