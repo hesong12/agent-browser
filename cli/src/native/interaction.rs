@@ -221,6 +221,7 @@ pub async fn fill(
         &object_id,
         selector_or_ref,
         value,
+        true,
     )
     .await
 }
@@ -231,15 +232,18 @@ pub async fn fill(
 /// the text goes nowhere. Report that instead of success. An element the page
 /// blurs after accepting the text (a field that moves on after its last digit)
 /// still holds the text, so it counts as reached.
-/// A replacement can also receive the text. Accept that observed delivery only
+/// A replacement can also receive a fill. Accept that observed delivery only
 /// for a unique same-ID control with the same type and naming attributes and
 /// the exact requested value; never redirect or repeat input here.
+/// Type may append to existing text or replace a selection, so matching its
+/// argument alone cannot prove the requested edit on a replacement.
 async fn ensure_text_reached(
     client: &CdpClient,
     session_id: &str,
     object_id: &str,
     selector_or_ref: &str,
     text: &str,
+    allow_equivalent_replacement: bool,
 ) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
@@ -250,6 +254,7 @@ async fn ensure_text_reached(
             &CallFunctionOnParams {
                 function_declaration: r#"function(expected) {
                     if (!this.isConnected) {
+                        if (expected === null) return false;
                         const doc = this.ownerDocument;
                         const active = doc.activeElement;
                         if (!this.id || !active || active.id !== this.id ||
@@ -266,7 +271,7 @@ async fn ensure_text_reached(
                 .to_string(),
                 object_id: Some(object_id.to_string()),
                 arguments: Some(vec![CallArgument {
-                    value: Some(serde_json::json!(text)),
+                    value: Some(serde_json::json!(allow_equivalent_replacement.then_some(text))),
                     object_id: None,
                 }]),
                 return_by_value: Some(true),
@@ -346,6 +351,7 @@ pub async fn type_text(
         &object_id,
         selector_or_ref,
         text,
+        false,
     )
     .await
 }
