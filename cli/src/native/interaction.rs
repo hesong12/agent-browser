@@ -215,7 +215,14 @@ pub async fn fill(
         )
         .await?;
 
-    ensure_text_reached(client, &effective_session_id, &object_id, selector_or_ref, value).await
+    ensure_text_reached(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        value,
+    )
+    .await
 }
 
 /// Input.insertText and key events go to whatever the page has focused, not to
@@ -224,6 +231,9 @@ pub async fn fill(
 /// the text goes nowhere. Report that instead of success. An element the page
 /// blurs after accepting the text (a field that moves on after its last digit)
 /// still holds the text, so it counts as reached.
+/// A replacement can also receive the text. Accept that observed delivery only
+/// for a unique same-ID control with the same type and naming attributes and
+/// the exact requested value; never redirect or repeat input here.
 async fn ensure_text_reached(
     client: &CdpClient,
     session_id: &str,
@@ -238,14 +248,27 @@ async fn ensure_text_reached(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    if (!this.isConnected) return false;
+                function_declaration: r#"function(expected) {
+                    if (!this.isConnected) {
+                        const doc = this.ownerDocument;
+                        const active = doc.activeElement;
+                        if (!this.id || !active || active.id !== this.id ||
+                            active.tagName !== this.tagName || active.type !== this.type ||
+                            doc.querySelectorAll('#' + CSS.escape(this.id)).length !== 1) return false;
+                        if (['role', 'name', 'aria-label', 'aria-labelledby'].some(
+                            name => active.getAttribute(name) !== this.getAttribute(name)
+                        )) return false;
+                        return active.value === expected;
+                    }
                     if (this.getRootNode().activeElement === this) return true;
                     return !!('value' in this ? this.value : this.textContent);
                 }"#
                 .to_string(),
                 object_id: Some(object_id.to_string()),
-                arguments: None,
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(text)),
+                    object_id: None,
+                }]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -317,7 +340,14 @@ pub async fn type_text(
     }
 
     type_text_into_active_context(client, session_id, text, delay_ms).await?;
-    ensure_text_reached(client, &effective_session_id, &object_id, selector_or_ref, text).await
+    ensure_text_reached(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        text,
+    )
+    .await
 }
 
 pub async fn type_text_into_active_context(

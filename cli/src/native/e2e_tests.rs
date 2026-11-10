@@ -17133,3 +17133,81 @@ async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
+
+#[tokio::test]
+#[ignore]
+async fn e2e_fill_and_type_recognize_text_delivered_to_equivalent_replacement() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+
+    for action in ["fill", "type"] {
+        for variant in [
+            "equivalent",
+            "different-label",
+            "different-type",
+            "duplicate-id",
+            "no-input",
+        ] {
+            assert_success(
+                &execute_command(
+                    &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+                    &mut state,
+                )
+                .await,
+            );
+            let script = format!(
+                r#"(() => {{
+                document.body.innerHTML = '<input id="search" role="combobox" aria-label="Search" name="query">';
+                const original = document.getElementById('search');
+                original.onfocus = () => {{
+                    const replacement = original.cloneNode(true);
+                    original.replaceWith(replacement);
+                    if ('{variant}' === 'different-label') replacement.setAttribute('aria-label', 'Other');
+                    if ('{variant}' === 'different-type') replacement.type = 'password';
+                    if ('{variant}' === 'duplicate-id') document.body.append(replacement.cloneNode(true));
+                    if ('{variant}' === 'no-input') replacement.onbeforeinput = event => event.preventDefault();
+                    replacement.focus();
+                }};
+            }})()"#
+            );
+            assert_success(
+                &execute_command(
+                    &json!({ "id": "setup", "action": "evaluate", "script": script }),
+                    &mut state,
+                )
+                .await,
+            );
+            let key = if action == "fill" { "value" } else { "text" };
+            let result = execute_command(
+                &json!({ "id": "edit", "action": action, "selector": "#search", key: "query" }),
+                &mut state,
+            )
+            .await;
+            assert_evaluate(
+                &mut state,
+                "value",
+                "document.activeElement.value",
+                if variant == "no-input" {
+                    json!("")
+                } else {
+                    json!("query")
+                },
+            )
+            .await;
+            assert_eq!(
+                result["success"],
+                variant == "equivalent",
+                "{action} / {variant}: {result}"
+            );
+        }
+    }
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+}
