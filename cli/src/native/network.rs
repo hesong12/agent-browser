@@ -199,6 +199,15 @@ async fn install_domain_filter_runtime_script(
         return Ok(());
     }
 
+    // An auto-attached target paused before its first document has no
+    // context to patch; the new-document script installed just before covers
+    // that document. Chrome 157 holds Runtime.evaluate on such a target until
+    // it resumes (earlier versions answered "Cannot find default execution
+    // context"), so evaluating there would wait out the command timeout.
+    if paused_before_document {
+        return Ok(());
+    }
+
     let script = domain_filter_script(allowed_domains);
     let evaluation = match client
         .send_command(
@@ -694,6 +703,15 @@ mod tests {
         message: &'static str,
         paused_before_document: bool,
     ) -> Result<(), String> {
+        install_script_with_runtime_answer(Some(message), paused_before_document).await
+    }
+
+    /// `None` never answers Runtime.evaluate, as Chrome 157 holds it on a
+    /// target paused before its first document.
+    async fn install_script_with_runtime_answer(
+        message: Option<&'static str>,
+        paused_before_document: bool,
+    ) -> Result<(), String> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -706,6 +724,7 @@ mod tests {
                 let request: Value = serde_json::from_str(&text).unwrap();
                 let mut response = json!({ "id": request["id"] });
                 if request["method"] == "Runtime.evaluate" {
+                    let Some(message) = message else { continue };
                     response["error"] = json!({ "code": -32000, "message": message });
                 } else {
                     response["result"] = json!({ "identifier": "1" });
@@ -749,8 +768,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn domain_filter_script_does_not_wait_on_a_paused_target() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            install_script_with_runtime_answer(None, true),
+        )
+        .await
+        .expect("a paused target must not wait for Runtime.evaluate");
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
     async fn domain_filter_script_fails_closed_on_other_runtime_errors() {
-        let error = install_script_with_runtime_error("Execution context was destroyed.", true)
+        let error = install_script_with_runtime_error("Execution context was destroyed.", false)
             .await
             .unwrap_err();
         assert!(
