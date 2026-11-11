@@ -49,6 +49,7 @@ type MethodTaps =
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const CDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_CLOSED_ERROR: &str = "CDP connection closed";
 
 fn normalize_websocket_root_path(url: &str) -> String {
@@ -486,6 +487,17 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.send_command_with_timeout(method, params, session_id, CDP_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn send_command_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -520,7 +532,7 @@ impl CdpClient {
             }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        let response = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => {
                 guard.done = true;
                 resp
@@ -606,10 +618,31 @@ impl CdpClient {
         params: &P,
         session_id: Option<&str>,
     ) -> Result<R, String> {
+        self.send_command_typed_with_wait(method, params, session_id, Duration::ZERO)
+            .await
+    }
+
+    /// A renderer-side wait gets its configured duration as well as the normal
+    /// transport allowance to return the completed response.
+    pub async fn send_command_typed_with_wait<
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    >(
+        &self,
+        method: &str,
+        params: &P,
+        session_id: Option<&str>,
+        wait: Duration,
+    ) -> Result<R, String> {
         let params_value = serde_json::to_value(params)
             .map_err(|e| format!("Failed to serialize params: {}", e))?;
         let result = self
-            .send_command(method, Some(params_value), session_id)
+            .send_command_with_timeout(
+                method,
+                Some(params_value),
+                session_id,
+                CDP_RESPONSE_TIMEOUT.saturating_add(wait),
+            )
             .await?;
         serde_json::from_value(result)
             .map_err(|e| format!("Failed to deserialize CDP response for {}: {}", method, e))

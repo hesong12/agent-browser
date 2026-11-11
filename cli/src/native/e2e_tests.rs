@@ -17116,7 +17116,7 @@ async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
     }
 
     // A field that moves focus on once it has taken the text still holds it.
-    let blur = "data:text/html,<html><body><input id='otp' oninput='this.blur()'></body></html>";
+    let blur = "data:text/html,<html><body><input id='otp' oninput='if(this.value)this.blur()'></body></html>";
     let resp = execute_command(
         &json!({ "id": "4", "action": "navigate", "url": blur }),
         &mut state,
@@ -17129,6 +17129,36 @@ async fn e2e_fill_and_type_report_a_field_the_page_replaces_on_focus() {
     )
     .await;
     assert_success(&resp);
+
+    // Losing focus on the synthetic empty clear happens before native input.
+    // Never send the requested text to the newly focused unrelated field.
+    for action in ["fill", "type"] {
+        for handler in ["this.blur()", "document.getElementById('other').focus()"] {
+            assert_success(
+            &execute_command(
+                &json!({ "id": "empty-clear", "action": "navigate", "url": format!(
+                    "data:text/html,<input id='otp' oninput=\"{handler}\"><input id='other' value='keep'>"
+                ) }),
+                &mut state,
+            )
+            .await,
+        );
+            let key = if action == "fill" { "value" } else { "text" };
+            let result = execute_command(
+            &json!({ "id": "blur-edit", "action": action, "selector": "#otp", key: "7", "clear": true }),
+            &mut state,
+        )
+        .await;
+            assert_eq!(result["success"], false, "{action}: {result}");
+            assert_evaluate(
+            &mut state,
+            "empty-value",
+            "({target: document.getElementById('otp').value, other: document.getElementById('other').value})",
+            json!({"target": "", "other": "keep"}),
+        )
+        .await;
+        }
+    }
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -17145,14 +17175,24 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
         )
         .await,
     );
+    state.default_timeout_ms = 1_000;
 
     for action in ["fill", "type"] {
         for variant in [
             "equivalent",
+            "render-focus",
+            "late-focus",
+            "late-redirect",
+            "late-changed-value",
+            "late-duplicate",
+            "never-focused",
             "different-label",
             "different-type",
             "duplicate-id",
+            "different-value",
+            "editable-replacement",
             "no-input",
+            "partial-input",
             "prefilled-blocked",
         ] {
             assert_success(
@@ -17165,16 +17205,31 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
             let script = format!(
                 r#"(() => {{
                 document.body.innerHTML = '<input id="search" role="combobox" aria-label="Search" name="query">';
+                if ('{variant}' === 'editable-replacement') document.body.innerHTML = '<div id="search" contenteditable="true" role="textbox" aria-label="Search">before</div>';
                 const original = document.getElementById('search');
                 if ('{variant}' === 'prefilled-blocked') original.value = 'query';
                 original.onfocus = () => {{
                     const replacement = original.cloneNode(true);
                     original.replaceWith(replacement);
+                    const later = callback => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(callback)));
                     if ('{variant}' === 'different-label') replacement.setAttribute('aria-label', 'Other');
                     if ('{variant}' === 'different-type') replacement.type = 'password';
                     if ('{variant}' === 'duplicate-id') document.body.append(replacement.cloneNode(true));
+                    if ('{variant}' === 'different-value') replacement.value = 'other';
+                    if ('{variant}' === 'editable-replacement') replacement.textContent = 'other';
                     if (['no-input', 'prefilled-blocked'].includes('{variant}')) replacement.onbeforeinput = event => event.preventDefault();
-                    replacement.focus();
+                    if ('{variant}' === 'partial-input') replacement.onbeforeinput = event => {{ if (event.data !== 'q') event.preventDefault(); }};
+                    if ('{variant}' === 'render-focus') requestAnimationFrame(() => replacement.focus());
+                    else if ('{variant}' === 'late-focus') later(() => replacement.focus());
+                    else if ('{variant}' === 'late-redirect') {{
+                        const other = document.createElement('input');
+                        other.id = 'other'; other.value = 'keep'; document.body.append(other);
+                        later(() => other.focus());
+                    }}
+                    else if ('{variant}' === 'late-changed-value') later(() => {{ replacement.value = 'other'; replacement.focus(); }});
+                    else if ('{variant}' === 'late-duplicate') later(() => {{ document.body.append(replacement.cloneNode(true)); replacement.focus(); }});
+                    else if ('{variant}' === 'never-focused') {{}}
+                    else replacement.focus();
                 }};
             }})()"#
             );
@@ -17186,28 +17241,251 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
                 .await,
             );
             let key = if action == "fill" { "value" } else { "text" };
+            let started = std::time::Instant::now();
             let result = execute_command(
-                &json!({ "id": "edit", "action": action, "selector": "#search", key: "query" }),
+                &json!({ "id": "edit", "action": action, "selector": "#search", key: "query",
+                    "timeout": if variant == "never-focused" { 40 } else { state.default_timeout_ms } }),
                 &mut state,
             )
             .await;
+            if variant == "never-focused" {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_millis(state.default_timeout_ms)
+                );
+            }
             assert_evaluate(
                 &mut state,
                 "value",
-                "document.activeElement.value",
-                if variant == "no-input" {
-                    json!("")
-                } else {
-                    json!("query")
+                "document.getElementById('search').value ?? document.getElementById('search').textContent",
+                match variant {
+                    "equivalent" | "render-focus" | "late-focus" => json!("query"),
+                    "different-value" | "editable-replacement" | "late-changed-value" => json!("other"),
+                    "prefilled-blocked" if action == "type" => json!("query"),
+                    "partial-input" if action == "type" => json!("q"),
+                    _ => json!(""),
                 },
             )
             .await;
             assert_eq!(
                 result["success"],
-                action == "fill" && ["equivalent", "prefilled-blocked"].contains(&variant),
+                ["equivalent", "render-focus", "late-focus"].contains(&variant),
                 "{action} / {variant}: {result}"
             );
+            if variant == "late-redirect" {
+                assert_evaluate(
+                    &mut state,
+                    "unrelated",
+                    "document.getElementById('other').value",
+                    json!("keep"),
+                )
+                .await;
+            }
         }
+    }
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_pending_focus_honors_wait_beyond_transport_timeout() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    state.default_timeout_ms = 35_000;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+            &mut state,
+        )
+        .await,
+    );
+    let script = r#"(() => {
+        document.body.innerHTML = '<input id="search" role="combobox" aria-label="Search"><input id="other" value="keep">';
+        window.trustedInputs = 0;
+        document.oninput = event => { if (event.isTrusted) trustedInputs++; };
+        const original = document.getElementById('search');
+        original.onfocus = () => {
+            const started = performance.now();
+            const replacement = original.cloneNode(true);
+            original.replaceWith(replacement);
+            setTimeout(() => {
+                window.focusDelay = performance.now() - started;
+                replacement.focus();
+            }, 31000);
+        };
+    })()"#;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "setup", "action": "evaluate", "script": script }),
+            &mut state,
+        )
+        .await,
+    );
+    let result = execute_command(
+        &json!({ "id": "fill", "action": "fill", "selector": "#search", "value": "query" }),
+        &mut state,
+    )
+    .await;
+    let observed = execute_command(
+        &json!({ "id": "read", "action": "evaluate", "script":
+            "({value:document.getElementById('search').value, other:document.getElementById('other').value, trustedInputs, focusDelay:window.focusDelay})" }),
+        &mut state,
+    )
+    .await;
+    let closed = execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await;
+    assert_success(&closed);
+    assert_success(&result);
+    assert_success(&observed);
+    let actual = &get_data(&observed)["result"];
+    assert_eq!(actual["value"], "query");
+    assert_eq!(actual["other"], "keep");
+    assert_eq!(actual["trustedInputs"], 1);
+    assert!(actual["focusDelay"].as_f64().unwrap() >= 30_000.0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_empty_clear_survives_focus_changes() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    for tag in ["input", "textarea"] {
+        for action in ["fill", "type"] {
+            for (handler, success) in [
+                ("target.blur()", true),
+                ("document.getElementById('other').focus()", true),
+                ("target.value = 'before'", false),
+            ] {
+                assert_success(
+                    &execute_command(
+                        &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+                        &mut state,
+                    )
+                    .await,
+                );
+                let script = format!(
+                    "document.body.innerHTML = '<{tag} id=target></{tag}><input id=other value=keep>'; \
+                    const target = document.getElementById('target'); target.value = 'before'; \
+                    window.trustedInputs = 0; document.oninput = event => {{ if (event.isTrusted) trustedInputs++; }}; \
+                    target.oninput = () => {{ {handler}; }};"
+                );
+                assert_success(
+                    &execute_command(
+                        &json!({ "id": "setup", "action": "evaluate", "script": script }),
+                        &mut state,
+                    )
+                    .await,
+                );
+                let key = if action == "fill" { "value" } else { "text" };
+                let result = execute_command(
+                    &json!({ "id": "clear", "action": action, "selector": "#target", key: "", "clear": true }),
+                    &mut state,
+                )
+                .await;
+                assert_eq!(
+                    result["success"], success,
+                    "{tag} / {action} / {handler}: {result}"
+                );
+                assert_evaluate(
+                    &mut state,
+                    "cleared",
+                    "({value: document.getElementById('target').value, other: document.getElementById('other').value, trustedInputs})",
+                    json!({"value": if success { "" } else { "before" }, "other": "keep", "trustedInputs": 0}),
+                )
+                .await;
+            }
+        }
+    }
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_type_preserves_selection_and_checks_delivery() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    for (kind, setup, text, clear, expected) in [
+        (
+            "input",
+            "target.value = 'before'; target.setSelectionRange(6, 6)",
+            "after",
+            false,
+            "beforeafter",
+        ),
+        (
+            "input",
+            "target.value = 'before'; target.setSelectionRange(1, 4)",
+            "X",
+            false,
+            "bXre",
+        ),
+        ("input", "target.value = 'before'", "after", true, "after"),
+        (
+            "textarea",
+            "target.value = 'before'; target.setSelectionRange(1, 4)",
+            "X",
+            false,
+            "bXre",
+        ),
+        ("number", "", "12", false, "12"),
+        ("editable", "", "query", false, "query"),
+    ] {
+        assert_success(
+            &execute_command(
+                &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+                &mut state,
+            )
+            .await,
+        );
+        let html = match kind {
+            "textarea" => "<textarea id='target'></textarea>",
+            "number" => "<input id='target' type='number'>",
+            "editable" => "<div id='target' contenteditable='true'></div>",
+            _ => "<input id='target'>",
+        };
+        assert_success(
+            &execute_command(
+                &json!({ "id": "setup", "action": "evaluate", "script": format!(
+                    "document.body.innerHTML = {html:?}; const target = document.getElementById('target'); target.focus(); {setup};"
+                ) }),
+                &mut state,
+            )
+            .await,
+        );
+        assert_success(
+            &execute_command(
+                &json!({ "id": "type", "action": "type", "selector": "#target", "text": text, "clear": clear }),
+                &mut state,
+            )
+            .await,
+        );
+        assert_evaluate(
+            &mut state,
+            "value",
+            "document.getElementById('target').value ?? document.getElementById('target').textContent",
+            json!(expected),
+        )
+        .await;
     }
     assert_success(
         &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
