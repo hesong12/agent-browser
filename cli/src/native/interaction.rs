@@ -184,15 +184,21 @@ pub async fn fill(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
+                function_declaration: r#"function(clearOnly) {
                     this.select && this.select();
                     this.value = '';
                     this.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (clearOnly && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                        return this.isConnected && this.value === '';
+                    }
                     return this.isConnected && this.getRootNode().activeElement === this;
                 }"#
                 .to_string(),
                 object_id: Some(object_id.clone()),
-                arguments: None,
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(value.is_empty())),
+                    object_id: None,
+                }]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -201,6 +207,9 @@ pub async fn fill(
         .await?;
     if cleared.result.value != Some(Value::Bool(true)) {
         return Err(text_target_lost(selector_or_ref));
+    }
+    if value.is_empty() {
+        return Ok(());
     }
 
     // Insert text (keyboard input dispatched at page level, use parent session_id)
@@ -237,7 +246,7 @@ async fn prepare_text_target(
     timeout_ms: u64,
 ) -> Result<String, String> {
     let result: EvaluateResult = client
-        .send_command_typed(
+        .send_command_typed_with_wait(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: r#"async function(timeout) {
@@ -289,6 +298,7 @@ async fn prepare_text_target(
                 await_promise: Some(true),
             },
             Some(session_id),
+            std::time::Duration::from_millis(timeout_ms),
         )
         .await?;
     if result.exception_details.is_some() {
@@ -407,24 +417,37 @@ pub async fn type_text(
     .await?;
 
     if clear {
-        client
-            .send_command_typed::<_, Value>(
+        let cleared: EvaluateResult = client
+            .send_command_typed(
                 "Runtime.callFunctionOn",
                 &CallFunctionOnParams {
-                    function_declaration: r#"function() {
+                    function_declaration: r#"function(clearOnly) {
                         this.select && this.select();
                         this.value = '';
                         this.dispatchEvent(new Event('input', { bubbles: true }));
+                        if (clearOnly && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                            return this.isConnected && this.value === '';
+                        }
+                        return this.isConnected && this.getRootNode().activeElement === this;
                     }"#
                     .to_string(),
                     object_id: Some(object_id.clone()),
-                    arguments: None,
+                    arguments: Some(vec![CallArgument {
+                        value: Some(serde_json::json!(text.is_empty())),
+                        object_id: None,
+                    }]),
                     return_by_value: Some(true),
                     await_promise: Some(false),
                 },
                 Some(&effective_session_id),
             )
             .await?;
+        if cleared.result.value != Some(Value::Bool(true)) {
+            return Err(text_target_lost(selector_or_ref));
+        }
+        if text.is_empty() {
+            return Ok(());
+        }
     }
 
     // For ordinary native text edits, preserve the actual caret/selection when

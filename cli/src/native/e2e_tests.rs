@@ -17289,6 +17289,132 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_pending_focus_honors_wait_beyond_transport_timeout() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    state.default_timeout_ms = 35_000;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+            &mut state,
+        )
+        .await,
+    );
+    let script = r#"(() => {
+        document.body.innerHTML = '<input id="search" role="combobox" aria-label="Search"><input id="other" value="keep">';
+        window.trustedInputs = 0;
+        document.oninput = event => { if (event.isTrusted) trustedInputs++; };
+        const original = document.getElementById('search');
+        original.onfocus = () => {
+            const started = performance.now();
+            const replacement = original.cloneNode(true);
+            original.replaceWith(replacement);
+            setTimeout(() => {
+                window.focusDelay = performance.now() - started;
+                replacement.focus();
+            }, 31000);
+        };
+    })()"#;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "setup", "action": "evaluate", "script": script }),
+            &mut state,
+        )
+        .await,
+    );
+    let result = execute_command(
+        &json!({ "id": "fill", "action": "fill", "selector": "#search", "value": "query" }),
+        &mut state,
+    )
+    .await;
+    let observed = execute_command(
+        &json!({ "id": "read", "action": "evaluate", "script":
+            "({value:document.getElementById('search').value, other:document.getElementById('other').value, trustedInputs, focusDelay:window.focusDelay})" }),
+        &mut state,
+    )
+    .await;
+    let closed = execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await;
+    assert_success(&closed);
+    assert_success(&result);
+    assert_success(&observed);
+    let actual = &get_data(&observed)["result"];
+    assert_eq!(actual["value"], "query");
+    assert_eq!(actual["other"], "keep");
+    assert_eq!(actual["trustedInputs"], 1);
+    assert!(actual["focusDelay"].as_f64().unwrap() >= 30_000.0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_empty_clear_survives_focus_changes() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    for tag in ["input", "textarea"] {
+        for action in ["fill", "type"] {
+            for (handler, success) in [
+                ("target.blur()", true),
+                ("document.getElementById('other').focus()", true),
+                ("target.value = 'before'", false),
+            ] {
+                assert_success(
+                    &execute_command(
+                        &json!({ "id": "open", "action": "navigate", "url": "about:blank" }),
+                        &mut state,
+                    )
+                    .await,
+                );
+                let script = format!(
+                    "document.body.innerHTML = '<{tag} id=target></{tag}><input id=other value=keep>'; \
+                    const target = document.getElementById('target'); target.value = 'before'; \
+                    window.trustedInputs = 0; document.oninput = event => {{ if (event.isTrusted) trustedInputs++; }}; \
+                    target.oninput = () => {{ {handler}; }};"
+                );
+                assert_success(
+                    &execute_command(
+                        &json!({ "id": "setup", "action": "evaluate", "script": script }),
+                        &mut state,
+                    )
+                    .await,
+                );
+                let key = if action == "fill" { "value" } else { "text" };
+                let result = execute_command(
+                    &json!({ "id": "clear", "action": action, "selector": "#target", key: "", "clear": true }),
+                    &mut state,
+                )
+                .await;
+                assert_eq!(
+                    result["success"], success,
+                    "{tag} / {action} / {handler}: {result}"
+                );
+                assert_evaluate(
+                    &mut state,
+                    "cleared",
+                    "({value: document.getElementById('target').value, other: document.getElementById('other').value, trustedInputs})",
+                    json!({"value": if success { "" } else { "before" }, "other": "keep", "trustedInputs": 0}),
+                )
+                .await;
+            }
+        }
+    }
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_type_preserves_selection_and_checks_delivery() {
     let mut state = DaemonState::new();
     assert_success(
