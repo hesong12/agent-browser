@@ -159,6 +159,7 @@ pub async fn fill(
     selector_or_ref: &str,
     value: &str,
     iframe_sessions: &HashMap<String, String>,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -169,8 +170,14 @@ pub async fn fill(
     )
     .await?;
 
-    let object_id =
-        prepare_text_target(client, &effective_session_id, &object_id, selector_or_ref).await?;
+    let object_id = prepare_text_target(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        timeout_ms,
+    )
+    .await?;
 
     // Select all + delete to clear
     let cleared: EvaluateResult = client
@@ -220,19 +227,20 @@ pub async fn fill(
 }
 
 /// Focusing a collapsed control can synchronously detach it and leave BODY
-/// active until the browser renders its expanded control. Observe that render
-/// before sending any keys, and bind only the page's own equivalent focus target.
+/// active until the page focuses its expanded control. Observe the render and
+/// any pending focus event before sending keys; never focus a replacement here.
 async fn prepare_text_target(
     client: &CdpClient,
     session_id: &str,
     object_id: &str,
     selector_or_ref: &str,
+    timeout_ms: u64,
 ) -> Result<String, String> {
     let result: EvaluateResult = client
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"async function() {
+                function_declaration: r#"async function(timeout) {
                     const value = this.value;
                     this.focus();
                     await new Promise(resolve => this.ownerDocument.defaultView.requestAnimationFrame(resolve));
@@ -240,20 +248,43 @@ async fn prepare_text_target(
                         return this.getRootNode().activeElement === this ? this : null;
                     }
                     const doc = this.ownerDocument;
-                    const active = doc.activeElement;
-                    if (!['INPUT', 'TEXTAREA'].includes(this.tagName) ||
-                        !this.id || !active || active.id !== this.id ||
-                        active.tagName !== this.tagName || active.type !== this.type ||
-                        active.value !== value ||
-                        doc.querySelectorAll('#' + CSS.escape(this.id)).length !== 1) return null;
-                    if (['role', 'name', 'aria-label', 'aria-labelledby'].some(
-                        name => active.getAttribute(name) !== this.getAttribute(name)
-                    )) return null;
-                    return active;
+                    const equivalent = () => {
+                        if (!['INPUT', 'TEXTAREA'].includes(this.tagName) || !this.id) return null;
+                        const matches = doc.querySelectorAll('#' + CSS.escape(this.id));
+                        if (matches.length !== 1) return null;
+                        const candidate = matches[0];
+                        if (candidate.tagName !== this.tagName || candidate.type !== this.type ||
+                            candidate.value !== value ||
+                            ['role', 'name', 'aria-label', 'aria-labelledby'].some(
+                                name => candidate.getAttribute(name) !== this.getAttribute(name)
+                            )) return null;
+                        return candidate;
+                    };
+                    const candidate = equivalent();
+                    if (!candidate) return null;
+                    if (doc.activeElement === candidate) return candidate;
+                    if (doc.activeElement && doc.activeElement !== doc.body &&
+                        doc.activeElement !== doc.documentElement) return null;
+                    return new Promise(resolve => {
+                        const finish = target => {
+                            doc.removeEventListener('focusin', onFocus, true);
+                            clearTimeout(timer);
+                            resolve(target);
+                        };
+                        const onFocus = () => {
+                            const current = equivalent();
+                            finish(current && doc.activeElement === current ? current : null);
+                        };
+                        doc.addEventListener('focusin', onFocus, true);
+                        const timer = setTimeout(() => finish(null), timeout);
+                    });
                 }"#
                 .to_string(),
                 object_id: Some(object_id.to_string()),
-                arguments: None,
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(timeout_ms)),
+                    object_id: None,
+                }]),
                 return_by_value: Some(false),
                 await_promise: Some(true),
             },
@@ -355,6 +386,7 @@ pub async fn type_text(
     clear: bool,
     delay_ms: Option<u64>,
     iframe_sessions: &HashMap<String, String>,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -365,8 +397,14 @@ pub async fn type_text(
     )
     .await?;
 
-    let object_id =
-        prepare_text_target(client, &effective_session_id, &object_id, selector_or_ref).await?;
+    let object_id = prepare_text_target(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        timeout_ms,
+    )
+    .await?;
 
     if clear {
         client

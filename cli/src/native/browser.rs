@@ -3092,6 +3092,7 @@ mod tests {
             "#search",
             "query",
             &HashMap::new(),
+            super::super::actions::DaemonState::new().default_timeout_ms,
         )
         .await;
         let result = manager

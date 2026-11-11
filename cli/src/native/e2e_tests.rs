@@ -17175,11 +17175,17 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
         )
         .await,
     );
+    state.default_timeout_ms = 1_000;
 
     for action in ["fill", "type"] {
         for variant in [
             "equivalent",
             "render-focus",
+            "late-focus",
+            "late-redirect",
+            "late-changed-value",
+            "late-duplicate",
+            "never-focused",
             "different-label",
             "different-type",
             "duplicate-id",
@@ -17205,6 +17211,7 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
                 original.onfocus = () => {{
                     const replacement = original.cloneNode(true);
                     original.replaceWith(replacement);
+                    const later = callback => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(callback)));
                     if ('{variant}' === 'different-label') replacement.setAttribute('aria-label', 'Other');
                     if ('{variant}' === 'different-type') replacement.type = 'password';
                     if ('{variant}' === 'duplicate-id') document.body.append(replacement.cloneNode(true));
@@ -17213,6 +17220,15 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
                     if (['no-input', 'prefilled-blocked'].includes('{variant}')) replacement.onbeforeinput = event => event.preventDefault();
                     if ('{variant}' === 'partial-input') replacement.onbeforeinput = event => {{ if (event.data !== 'q') event.preventDefault(); }};
                     if ('{variant}' === 'render-focus') requestAnimationFrame(() => replacement.focus());
+                    else if ('{variant}' === 'late-focus') later(() => replacement.focus());
+                    else if ('{variant}' === 'late-redirect') {{
+                        const other = document.createElement('input');
+                        other.id = 'other'; other.value = 'keep'; document.body.append(other);
+                        later(() => other.focus());
+                    }}
+                    else if ('{variant}' === 'late-changed-value') later(() => {{ replacement.value = 'other'; replacement.focus(); }});
+                    else if ('{variant}' === 'late-duplicate') later(() => {{ document.body.append(replacement.cloneNode(true)); replacement.focus(); }});
+                    else if ('{variant}' === 'never-focused') {{}}
                     else replacement.focus();
                 }};
             }})()"#
@@ -17225,18 +17241,25 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
                 .await,
             );
             let key = if action == "fill" { "value" } else { "text" };
+            let started = std::time::Instant::now();
             let result = execute_command(
-                &json!({ "id": "edit", "action": action, "selector": "#search", key: "query" }),
+                &json!({ "id": "edit", "action": action, "selector": "#search", key: "query",
+                    "timeout": if variant == "never-focused" { 40 } else { state.default_timeout_ms } }),
                 &mut state,
             )
             .await;
+            if variant == "never-focused" {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_millis(state.default_timeout_ms)
+                );
+            }
             assert_evaluate(
                 &mut state,
                 "value",
-                "document.activeElement.value ?? document.activeElement.textContent",
+                "document.getElementById('search').value ?? document.getElementById('search').textContent",
                 match variant {
-                    "equivalent" | "render-focus" => json!("query"),
-                    "different-value" | "editable-replacement" => json!("other"),
+                    "equivalent" | "render-focus" | "late-focus" => json!("query"),
+                    "different-value" | "editable-replacement" | "late-changed-value" => json!("other"),
                     "prefilled-blocked" if action == "type" => json!("query"),
                     "partial-input" if action == "type" => json!("q"),
                     _ => json!(""),
@@ -17245,9 +17268,18 @@ async fn e2e_fill_and_type_preserve_delivery_truth_for_replacement_fields() {
             .await;
             assert_eq!(
                 result["success"],
-                ["equivalent", "render-focus"].contains(&variant),
+                ["equivalent", "render-focus", "late-focus"].contains(&variant),
                 "{action} / {variant}: {result}"
             );
+            if variant == "late-redirect" {
+                assert_evaluate(
+                    &mut state,
+                    "unrelated",
+                    "document.getElementById('other').value",
+                    json!("keep"),
+                )
+                .await;
+            }
         }
     }
     assert_success(

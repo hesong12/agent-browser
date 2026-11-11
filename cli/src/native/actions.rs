@@ -7289,6 +7289,7 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         selector,
         value,
         &state.iframe_sessions,
+        state.timeout_ms(cmd),
     )
     .await?;
     Ok(json!({ "filled": selector }))
@@ -7317,6 +7318,7 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         clear,
         delay,
         &state.iframe_sessions,
+        state.timeout_ms(cmd),
     )
     .await?;
     Ok(json!({ "typed": text }))
@@ -11183,6 +11185,7 @@ async fn execute_subaction(
                 selector,
                 value,
                 &state.iframe_sessions,
+                state.timeout_ms(cmd),
             )
             .await?;
             Ok(json!({ "filled": selector }))
