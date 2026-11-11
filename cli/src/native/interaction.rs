@@ -169,30 +169,19 @@ pub async fn fill(
     )
     .await?;
 
-    // Focus the element
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    let object_id =
+        prepare_text_target(client, &effective_session_id, &object_id, selector_or_ref).await?;
 
     // Select all + delete to clear
-    client
-        .send_command_typed::<_, Value>(
+    let cleared: EvaluateResult = client
+        .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: r#"function() {
                     this.select && this.select();
                     this.value = '';
                     this.dispatchEvent(new Event('input', { bubbles: true }));
+                    return this.isConnected && this.getRootNode().activeElement === this;
                 }"#
                 .to_string(),
                 object_id: Some(object_id.clone()),
@@ -203,6 +192,9 @@ pub async fn fill(
             Some(&effective_session_id),
         )
         .await?;
+    if cleared.result.value != Some(Value::Bool(true)) {
+        return Err(text_target_lost(selector_or_ref));
+    }
 
     // Insert text (keyboard input dispatched at page level, use parent session_id)
     client
@@ -221,9 +213,66 @@ pub async fn fill(
         &object_id,
         selector_or_ref,
         value,
+        Some(value),
         true,
     )
     .await
+}
+
+/// Focusing a collapsed control can synchronously detach it and leave BODY
+/// active until the browser renders its expanded control. Observe that render
+/// before sending any keys, and bind only the page's own equivalent focus target.
+async fn prepare_text_target(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    selector_or_ref: &str,
+) -> Result<String, String> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"async function() {
+                    const value = this.value;
+                    this.focus();
+                    await new Promise(resolve => this.ownerDocument.defaultView.requestAnimationFrame(resolve));
+                    if (this.isConnected) {
+                        return this.getRootNode().activeElement === this ? this : null;
+                    }
+                    const doc = this.ownerDocument;
+                    const active = doc.activeElement;
+                    if (!['INPUT', 'TEXTAREA'].includes(this.tagName) ||
+                        !this.id || !active || active.id !== this.id ||
+                        active.tagName !== this.tagName || active.type !== this.type ||
+                        active.value !== value ||
+                        doc.querySelectorAll('#' + CSS.escape(this.id)).length !== 1) return null;
+                    if (['role', 'name', 'aria-label', 'aria-labelledby'].some(
+                        name => active.getAttribute(name) !== this.getAttribute(name)
+                    )) return null;
+                    return active;
+                }"#
+                .to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: None,
+                return_by_value: Some(false),
+                await_promise: Some(true),
+            },
+            Some(session_id),
+        )
+        .await?;
+    if result.exception_details.is_some() {
+        return Err(text_target_lost(selector_or_ref));
+    }
+    result
+        .result
+        .object_id
+        .ok_or_else(|| text_target_lost(selector_or_ref))
+}
+
+fn text_target_lost(selector_or_ref: &str) -> String {
+    format!(
+        "The page replaced or unfocused {selector_or_ref} when it was focused, so the text did not go into that field. Take a new snapshot and check the field that is on the page now."
+    )
 }
 
 /// Input.insertText and key events go to whatever the page has focused, not to
@@ -243,6 +292,7 @@ async fn ensure_text_reached(
     object_id: &str,
     selector_or_ref: &str,
     text: &str,
+    expected_value: Option<&str>,
     allow_equivalent_replacement: bool,
 ) -> Result<(), String> {
     if text.is_empty() {
@@ -252,9 +302,9 @@ async fn ensure_text_reached(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function(expected) {
+                function_declaration: r#"function(expected, allowReplacement) {
                     if (!this.isConnected) {
-                        if (expected === null) return false;
+                        if (!allowReplacement || expected === null) return false;
                         const doc = this.ownerDocument;
                         const active = doc.activeElement;
                         if (!this.id || !active || active.id !== this.id ||
@@ -265,15 +315,24 @@ async fn ensure_text_reached(
                         )) return false;
                         return active.value === expected;
                     }
+                    if (expected !== null && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                        return this.value === expected;
+                    }
                     if (this.getRootNode().activeElement === this) return true;
                     return !!('value' in this ? this.value : this.textContent);
                 }"#
                 .to_string(),
                 object_id: Some(object_id.to_string()),
-                arguments: Some(vec![CallArgument {
-                    value: Some(serde_json::json!(allow_equivalent_replacement.then_some(text))),
-                    object_id: None,
-                }]),
+                arguments: Some(vec![
+                    CallArgument {
+                        value: Some(serde_json::json!(expected_value)),
+                        object_id: None,
+                    },
+                    CallArgument {
+                        value: Some(serde_json::json!(allow_equivalent_replacement)),
+                        object_id: None,
+                    },
+                ]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -283,9 +342,7 @@ async fn ensure_text_reached(
     if result.result.value == Some(Value::Bool(true)) {
         return Ok(());
     }
-    Err(format!(
-        "The page replaced or unfocused {selector_or_ref} when it was focused, so the text did not go into that field. Take a new snapshot and check the field that is on the page now."
-    ))
+    Err(text_target_lost(selector_or_ref))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,20 +365,8 @@ pub async fn type_text(
     )
     .await?;
 
-    // Focus
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    let object_id =
+        prepare_text_target(client, &effective_session_id, &object_id, selector_or_ref).await?;
 
     if clear {
         client
@@ -344,6 +389,36 @@ pub async fn type_text(
             .await?;
     }
 
+    // For ordinary native text edits, preserve the actual caret/selection when
+    // calculating delivery. A focused field alone does not prove keys arrived.
+    let expected: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function(text) {
+                    if (!this.isConnected || this.getRootNode().activeElement !== this) {
+                        throw new Error('The text target lost focus before typing');
+                    }
+                    if (typeof this.value !== 'string' ||
+                        typeof this.selectionStart !== 'number' ||
+                        typeof this.selectionEnd !== 'number' || /[\r\n\t]/.test(text)) return null;
+                    return this.value.slice(0, this.selectionStart) + text + this.value.slice(this.selectionEnd);
+                }"#
+                .to_string(),
+                object_id: Some(object_id.clone()),
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(text)),
+                    object_id: None,
+                }]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+    if expected.exception_details.is_some() {
+        return Err(text_target_lost(selector_or_ref));
+    }
     type_text_into_active_context(client, session_id, text, delay_ms).await?;
     ensure_text_reached(
         client,
@@ -351,6 +426,7 @@ pub async fn type_text(
         &object_id,
         selector_or_ref,
         text,
+        expected.result.value.as_ref().and_then(Value::as_str),
         false,
     )
     .await

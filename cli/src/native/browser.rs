@@ -1044,6 +1044,19 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Runtime.enable", Some(session_id))
             .await?;
+        // Keep DOM focus events synchronous even when the person's desktop
+        // focus is elsewhere. Otherwise the first key can activate a field
+        // whose focus handler replaces it, losing that input. Chromium's
+        // native focus emulation avoids bringing the person's window forward.
+        // Other CDP engines may not support this optional domain command.
+        let _ = self
+            .client
+            .send_command(
+                "Emulation.setFocusEmulationEnabled",
+                Some(json!({ "enabled": true })),
+                Some(session_id),
+            )
+            .await;
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
@@ -1317,6 +1330,14 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Runtime.enable", None)
             .await?;
+        let _ = self
+            .client
+            .send_command(
+                "Emulation.setFocusEmulationEnabled",
+                Some(json!({ "enabled": true })),
+                None,
+            )
+            .await;
         let _ = self
             .client
             .send_command_no_params("Runtime.runIfWaitingForDebugger", None)
@@ -3034,6 +3055,57 @@ async fn resolve_cdp_url(input: &str, headers: &[(String, String)]) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_background_page_has_focus_before_keyboard_input() {
+        let mut manager = BrowserManager::launch(
+            LaunchOptions {
+                headless: false,
+                executable_path: std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok(),
+                args: vec!["--no-startup-window".to_string()],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        manager
+            .navigate(
+                "data:text/html,<input id=search><script>window.focusEvents=[];search.onfocus=()=>focusEvents.push('focus');search.oninput=()=>focusEvents.push('input')</script>",
+                WaitUntil::Load,
+            )
+            .await
+            .unwrap();
+        // Keep the controlled page in the background, as when a person is
+        // working in another window. Keyboard input must not be what first
+        // activates its focus handlers.
+        manager.tab_new(None, None).await.unwrap();
+        manager.bring_to_front().await.unwrap();
+        manager.active_page_index = 0;
+        let focused = manager.evaluate("document.hasFocus()", None).await.unwrap();
+        let session_id = manager.active_session_id().unwrap().to_string();
+        let fill = super::super::interaction::fill(
+            &manager.client,
+            &session_id,
+            &RefMap::new(),
+            "#search",
+            "query",
+            &HashMap::new(),
+        )
+        .await;
+        let result = manager
+            .evaluate("({value:search.value, events:focusEvents})", None)
+            .await
+            .unwrap();
+        manager.close().await.unwrap();
+        assert_eq!(focused, json!(true));
+        fill.unwrap();
+        assert_eq!(
+            result,
+            json!({"value":"query", "events":["focus", "input", "input"]})
+        );
+    }
 
     #[test]
     fn cdp_port_address_needs_an_explicit_port() {
