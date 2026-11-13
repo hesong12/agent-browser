@@ -10975,7 +10975,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             let entry = state
                 .ref_map
                 .get(&ref_id)
-                .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+                .ok_or_else(|| state.ref_map.unknown_ref_error(&ref_id))?;
             let backend_node_id = entry
                 .backend_node_id
                 .ok_or_else(|| format!("Ref {} has no backend node id", ref_id))?;

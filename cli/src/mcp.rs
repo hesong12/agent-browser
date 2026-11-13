@@ -2376,6 +2376,12 @@ fn reject_unknown_arguments(
                 .map(|(_, candidate)| format!("{} for {}", candidate, key))
         })
         .collect();
+    let mut suggestions = suggestions;
+    for key in &unknown {
+        if let Some(advice) = argument_alias_advice(key, &own) {
+            suggestions.push(advice);
+        }
+    }
     let hint = if suggestions.is_empty() {
         String::new()
     } else {
@@ -2394,6 +2400,31 @@ fn reject_unknown_arguments(
         own,
         SHARED_ARGUMENTS.join(", ")
     )))
+}
+
+/// Names callers of other browser tools use for what this tool calls
+/// something else. The call is still refused (it is not guessed at); the
+/// refusal says where the value belongs.
+fn argument_alias_advice(key: &str, own: &[&str]) -> Option<String> {
+    let declares = |name: &str| own.contains(&name);
+    match key {
+        "ref" | "element" | "elementRef" | "target" | "css" | "xpath" if declares("selector") => {
+            Some(format!(
+                "selector for {key} (a CSS selector or an @eN reference from the latest snapshot)"
+            ))
+        }
+        "by" | "strategy" | "type" if declares("locator") => {
+            Some(format!("locator for {key} (role, text, label, placeholder, ...) with the searched value in value"))
+        }
+        "role" | "label" | "placeholder" | "testid" | "alt" | "title"
+            if declares("locator") && declares("value") =>
+        {
+            Some(format!(
+                "locator: \"{key}\" with the {key} you want in value (and name for the accessible name)"
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn wait_tool(
@@ -2687,6 +2718,7 @@ fn call_cli_tool(
                 | "plugins"
         )
     );
+    let command_args = with_wait_inside_call_limit(arguments, command_args);
     let cli_args = cli_tool_args(arguments, command_args, session.as_deref())?;
     if uses_session {
         let flags =
@@ -2702,6 +2734,28 @@ fn call_cli_tool(
         ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
     })?;
     Ok(tool_result_from_run(run))
+}
+
+/// A wait that the caller bounded only with `timeoutMs` would be killed with the
+/// process before the browser could report why the condition never held (the
+/// page's closest texts or selectors). Give the wait itself a deadline inside
+/// that limit so its diagnosis arrives; an explicit `waitTimeoutMs` is kept.
+fn with_wait_inside_call_limit(arguments: &Value, mut command_args: Vec<String>) -> Vec<String> {
+    let is_condition_wait = command_args.first().map(String::as_str) == Some("wait")
+        && command_args
+            .get(1)
+            .map(|a| a.parse::<u64>().is_err())
+            .unwrap_or(false)
+        && !command_args.iter().any(|a| a == "--timeout");
+    if !is_condition_wait {
+        return command_args;
+    }
+    if let Some(limit) = arguments.get("timeoutMs").and_then(Value::as_u64) {
+        let margin = (limit / 4).min(3_000);
+        command_args.push("--timeout".to_string());
+        command_args.push(limit.saturating_sub(margin).max(1).to_string());
+    }
+    command_args
 }
 
 /// Global flags an MCP caller may pass in extraArgs; every other global flag must come from the server's environment or config.
@@ -6072,6 +6126,45 @@ mod tests {
         let err =
             reject_unknown_arguments(TOOL_CLICK, &click, &json!({ "zzzzzzzz": 1 })).unwrap_err();
         assert!(!err.message.contains("Did you mean"), "{}", err.message);
+    }
+
+    #[test]
+    fn unknown_argument_error_says_where_a_misnamed_value_belongs() {
+        let click = find_tool(TOOL_CLICK).unwrap();
+        let err =
+            reject_unknown_arguments(TOOL_CLICK, &click, &json!({ "ref": "e81" })).unwrap_err();
+        assert!(err.message.contains("selector for ref"), "{}", err.message);
+        let find = find_tool(TOOL_FIND).unwrap();
+        let err = reject_unknown_arguments(TOOL_FIND, &find, &json!({ "by": "role" })).unwrap_err();
+        assert!(err.message.contains("locator for by"), "{}", err.message);
+        let err =
+            reject_unknown_arguments(TOOL_FIND, &find, &json!({ "role": "link" })).unwrap_err();
+        assert!(err.message.contains("locator: \"role\""), "{}", err.message);
+    }
+
+    #[test]
+    fn a_wait_bounded_by_the_call_limit_ends_before_the_limit() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let waited = with_wait_inside_call_limit(
+            &json!({ "timeoutMs": 15000 }),
+            args(&["wait", "--text", "Done"]),
+        );
+        assert_eq!(
+            waited,
+            args(&["wait", "--text", "Done", "--timeout", "12000"])
+        );
+        let own = args(&["wait", "--text", "Done", "--timeout", "5000"]);
+        assert_eq!(
+            with_wait_inside_call_limit(&json!({ "timeoutMs": 15000 }), own.clone()),
+            own
+        );
+        let pause = args(&["wait", "500"]);
+        assert_eq!(
+            with_wait_inside_call_limit(&json!({ "timeoutMs": 15000 }), pause.clone()),
+            pause
+        );
+        let none = args(&["wait", "--text", "Done"]);
+        assert_eq!(with_wait_inside_call_limit(&json!({}), none.clone()), none);
     }
 
     #[test]

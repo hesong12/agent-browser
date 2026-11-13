@@ -6033,7 +6033,9 @@ async fn e2e_diff_url_aligns_refs_after_snapshot() {
     )
     .await;
     assert_eq!(resp["success"], false);
-    assert!(resp["error"].as_str().unwrap().contains("Unknown ref: e1"));
+    let unknown = resp["error"].as_str().unwrap();
+    assert!(unknown.contains("Unknown ref: e1"), "{unknown}");
+    assert!(unknown.contains("Take a snapshot"), "{unknown}");
 
     // Populate the session ref map before comparing the same URL to itself.
     let resp = execute_command(&json!({ "id": "7", "action": "snapshot" }), &mut state).await;
@@ -6336,7 +6338,7 @@ async fn e2e_click_reports_covering_overlay() {
     assert_eq!(resp["success"], false, "covered target should fail: {resp}");
     let error = resp["error"].as_str().unwrap_or_default();
     assert!(
-        error.contains("covered by <div#consent-banner>"),
+        error.contains("covered by <div#consent-banner> (text=\"Dismiss\")"),
         "unexpected covered-click error: {}",
         error
     );

@@ -39,6 +39,26 @@ impl RefMap {
         }
     }
 
+    /// The reply for a ref that is not in the latest snapshot: each snapshot
+    /// replaces the refs of the one before, so a ref from an earlier snapshot
+    /// (or one the snapshot never held) does not resolve.
+    pub fn unknown_ref_error(&self, ref_id: &str) -> String {
+        let numbers: Vec<usize> = self
+            .map
+            .keys()
+            .filter_map(|k| k.strip_prefix('e')?.parse().ok())
+            .collect();
+        match (numbers.iter().min(), numbers.iter().max()) {
+            (Some(low), Some(high)) => format!(
+                "Unknown ref: {ref_id}. The latest snapshot holds {} refs (e{low} to e{high}); a ref from an earlier snapshot, or from a snapshot scoped or filtered to leave this element out, is not valid. Take a new snapshot and use the refs it lists.",
+                numbers.len()
+            ),
+            _ => format!(
+                "Unknown ref: {ref_id}. The session holds no refs. Take a snapshot and use the refs it lists."
+            ),
+        }
+    }
+
     pub fn add(
         &mut self,
         ref_id: String,
@@ -446,7 +466,7 @@ pub async fn resolve_element_center(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| ref_map.unknown_ref_error(&ref_id))?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
@@ -716,7 +736,7 @@ pub async fn resolve_element_object_id(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| ref_map.unknown_ref_error(&ref_id))?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
@@ -1054,7 +1074,23 @@ const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
         if (anchored && anchored !== hit)
             desc += ' inside ' + anchored.tagName.toLowerCase() + '#' + anchored.id;
     }
-    return desc;
+    // What the covering element is, so the caller can tell a dialog or banner
+    // from an ordinary wrapper without another round trip.
+    const said = (hit.getAttribute('aria-label') || '').trim();
+    const role = hit.getAttribute('role');
+    let more = '';
+    if (role) more += ' role=' + role;
+    if (said) more += ' aria-label="' + said.slice(0, 60) + '"';
+    else {
+        const text = (hit.innerText || hit.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text) more += ' text="' + text.slice(0, 60) + '"';
+    }
+    const dialog = hit.closest ? hit.closest('[role=dialog],[role=alertdialog],[aria-modal=true]') : null;
+    if (dialog) {
+        const title = (dialog.getAttribute('aria-label') || '').trim().slice(0, 60);
+        more += ' in a dialog' + (title ? ' "' + title + '"' : '');
+    }
+    return more ? desc + '\n' + more.trim() : desc;
 }"#;
 
 /// Returns why a click at (x, y) cannot reach `el`, or null when it can.
@@ -1062,7 +1098,8 @@ const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
 const ACTIONABILITY_JS: &str = r#"(doc, el, x, y) => {
     try {
         const rect = el.getBoundingClientRect();
-        if ((rect.width <= 0 && rect.height <= 0) || ['hidden', 'collapse'].includes(el.ownerDocument.defaultView.getComputedStyle(el).visibility)) return 'not visible';
+        if (rect.width <= 0 && rect.height <= 0) return 'not visible (it has no size on the page: hidden, collapsed or not rendered yet)';
+        if (['hidden', 'collapse'].includes(el.ownerDocument.defaultView.getComputedStyle(el).visibility)) return 'not visible (visibility is hidden)';
         if (el.disabled || el.matches(':disabled')) return 'disabled';
         const view = doc.defaultView;
         const outside = x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight;
@@ -1167,9 +1204,15 @@ pub(super) async fn selector_miss(
 }
 
 fn intercepted_error(target: &str, blocker: &str) -> String {
+    let (tag, what) = blocker.split_once('\n').unwrap_or((blocker, ""));
+    let what = if what.is_empty() {
+        String::new()
+    } else {
+        format!(" ({what})")
+    };
     format!(
-        "Element '{}' is covered by <{}> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
-        target, blocker
+        "Element '{}' is covered by <{}>{} at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
+        target, tag, what
     )
 }
 
