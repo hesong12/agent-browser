@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
-use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use super::element::{
+    resolve_element_center, resolve_element_object_id, session_viewport_offset, RefMap,
+};
 
 /// Outcome of a click. `dialog_opened` is true if a JavaScript dialog opened
 /// mid-sequence (the page is then blocked until `dialog accept`/`dismiss`).
@@ -14,8 +16,13 @@ use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 /// next click would register as a drag or double-click.
 #[derive(Default)]
 pub struct ClickResult {
+    /// Final pointer position in the top-level page viewport, including dialogs.
+    pub position: (f64, f64),
     pub dialog_opened: bool,
     pub pending_release: Option<PendingRelease>,
+    pub x: f64,
+    pub y: f64,
+    pub button_pressed: bool,
 }
 
 pub struct PendingRelease {
@@ -34,18 +41,45 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ClickResult, String> {
+    click_element(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        button,
+        click_count,
+        iframe_sessions,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn click_element(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    button: &str,
+    click_count: i32,
+    iframe_sessions: &HashMap<String, String>,
+    require_actionable: bool,
+) -> Result<ClickResult, String> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        require_actionable,
     )
     .await?;
     // A click-triggered dialog can fire on the frame's own session (OOPIF) or
     // on the top-level page session; both count as "ours". A dialog on any
     // other session belongs to a background tab and must not abort this click.
-    dispatch_click(
+    let offset =
+        session_viewport_offset(client, session_id, &effective_session_id, iframe_sessions).await?;
+    let mut result = dispatch_click(
         client,
         &effective_session_id,
         &[effective_session_id.as_str(), session_id],
@@ -54,7 +88,11 @@ pub async fn click(
         button,
         click_count,
     )
-    .await
+    .await?;
+    // Compute before dispatch: a click may navigate or open a blocking dialog.
+    result.position = (x + offset.0, y + offset.1);
+    (result.x, result.y) = result.position;
+    Ok(result)
 }
 
 pub async fn dblclick(
@@ -82,15 +120,18 @@ pub async fn hover(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<(f64, f64), String> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        false,
     )
     .await?;
+    let offset =
+        session_viewport_offset(client, session_id, &effective_session_id, iframe_sessions).await?;
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
@@ -108,7 +149,7 @@ pub async fn hover(
             Some(&effective_session_id),
         )
         .await?;
-    Ok(())
+    Ok((x + offset.0, y + offset.1))
 }
 
 pub async fn fill(
@@ -118,6 +159,7 @@ pub async fn fill(
     selector_or_ref: &str,
     value: &str,
     iframe_sessions: &HashMap<String, String>,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -128,40 +170,47 @@ pub async fn fill(
     )
     .await?;
 
-    // Focus the element
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    let object_id = prepare_text_target(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        timeout_ms,
+    )
+    .await?;
 
     // Select all + delete to clear
-    client
-        .send_command_typed::<_, Value>(
+    let cleared: EvaluateResult = client
+        .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
+                function_declaration: r#"function(clearOnly) {
                     this.select && this.select();
                     this.value = '';
                     this.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (clearOnly && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                        return this.isConnected && this.value === '';
+                    }
+                    return this.isConnected && this.getRootNode().activeElement === this;
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
-                arguments: None,
+                object_id: Some(object_id.clone()),
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(value.is_empty())),
+                    object_id: None,
+                }]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
             Some(&effective_session_id),
         )
         .await?;
+    if cleared.result.value != Some(Value::Bool(true)) {
+        return Err(text_target_lost(selector_or_ref));
+    }
+    if value.is_empty() {
+        return Ok(());
+    }
 
     // Insert text (keyboard input dispatched at page level, use parent session_id)
     client
@@ -174,7 +223,167 @@ pub async fn fill(
         )
         .await?;
 
-    Ok(())
+    ensure_text_reached(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        value,
+        Some(value),
+        true,
+    )
+    .await
+}
+
+/// Focusing a collapsed control can synchronously detach it and leave BODY
+/// active until the page focuses its expanded control. Observe the render and
+/// any pending focus event before sending keys; never focus a replacement here.
+async fn prepare_text_target(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    selector_or_ref: &str,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let result: EvaluateResult = client
+        .send_command_typed_with_wait(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"async function(timeout) {
+                    const value = this.value;
+                    this.focus();
+                    await new Promise(resolve => this.ownerDocument.defaultView.requestAnimationFrame(resolve));
+                    if (this.isConnected) {
+                        return this.getRootNode().activeElement === this ? this : null;
+                    }
+                    const doc = this.ownerDocument;
+                    const equivalent = () => {
+                        if (!['INPUT', 'TEXTAREA'].includes(this.tagName) || !this.id) return null;
+                        const matches = doc.querySelectorAll('#' + CSS.escape(this.id));
+                        if (matches.length !== 1) return null;
+                        const candidate = matches[0];
+                        if (candidate.tagName !== this.tagName || candidate.type !== this.type ||
+                            candidate.value !== value ||
+                            ['role', 'name', 'aria-label', 'aria-labelledby'].some(
+                                name => candidate.getAttribute(name) !== this.getAttribute(name)
+                            )) return null;
+                        return candidate;
+                    };
+                    const candidate = equivalent();
+                    if (!candidate) return null;
+                    if (doc.activeElement === candidate) return candidate;
+                    if (doc.activeElement && doc.activeElement !== doc.body &&
+                        doc.activeElement !== doc.documentElement) return null;
+                    return new Promise(resolve => {
+                        const finish = target => {
+                            doc.removeEventListener('focusin', onFocus, true);
+                            clearTimeout(timer);
+                            resolve(target);
+                        };
+                        const onFocus = () => {
+                            const current = equivalent();
+                            finish(current && doc.activeElement === current ? current : null);
+                        };
+                        doc.addEventListener('focusin', onFocus, true);
+                        const timer = setTimeout(() => finish(null), timeout);
+                    });
+                }"#
+                .to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(timeout_ms)),
+                    object_id: None,
+                }]),
+                return_by_value: Some(false),
+                await_promise: Some(true),
+            },
+            Some(session_id),
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await?;
+    if result.exception_details.is_some() {
+        return Err(text_target_lost(selector_or_ref));
+    }
+    result
+        .result
+        .object_id
+        .ok_or_else(|| text_target_lost(selector_or_ref))
+}
+
+fn text_target_lost(selector_or_ref: &str) -> String {
+    format!(
+        "The page replaced or unfocused {selector_or_ref} when it was focused, so the text did not go into that field. Take a new snapshot and check the field that is on the page now."
+    )
+}
+
+/// Input.insertText and key events go to whatever the page has focused, not to
+/// the element that was asked for. A page may replace or blur an element the
+/// moment it is focused (a collapsed search box that swaps in a new field), so
+/// the text goes nowhere. Report that instead of success. An element the page
+/// blurs after accepting the text (a field that moves on after its last digit)
+/// still holds the text, so it counts as reached.
+/// A replacement can also receive a fill. Accept that observed delivery only
+/// for a unique same-ID control with the same type and naming attributes and
+/// the exact requested value; never redirect or repeat input here.
+/// Type may append to existing text or replace a selection, so matching its
+/// argument alone cannot prove the requested edit on a replacement.
+async fn ensure_text_reached(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    selector_or_ref: &str,
+    text: &str,
+    expected_value: Option<&str>,
+    allow_equivalent_replacement: bool,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function(expected, allowReplacement) {
+                    if (!this.isConnected) {
+                        if (!allowReplacement || expected === null) return false;
+                        const doc = this.ownerDocument;
+                        const active = doc.activeElement;
+                        if (!this.id || !active || active.id !== this.id ||
+                            active.tagName !== this.tagName || active.type !== this.type ||
+                            doc.querySelectorAll('#' + CSS.escape(this.id)).length !== 1) return false;
+                        if (['role', 'name', 'aria-label', 'aria-labelledby'].some(
+                            name => active.getAttribute(name) !== this.getAttribute(name)
+                        )) return false;
+                        return active.value === expected;
+                    }
+                    if (expected !== null && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                        return this.value === expected;
+                    }
+                    if (this.getRootNode().activeElement === this) return true;
+                    return !!('value' in this ? this.value : this.textContent);
+                }"#
+                .to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: Some(vec![
+                    CallArgument {
+                        value: Some(serde_json::json!(expected_value)),
+                        object_id: None,
+                    },
+                    CallArgument {
+                        value: Some(serde_json::json!(allow_equivalent_replacement)),
+                        object_id: None,
+                    },
+                ]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    if result.result.value == Some(Value::Bool(true)) {
+        return Ok(());
+    }
+    Err(text_target_lost(selector_or_ref))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -187,6 +396,7 @@ pub async fn type_text(
     clear: bool,
     delay_ms: Option<u64>,
     iframe_sessions: &HashMap<String, String>,
+    timeout_ms: u64,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -197,43 +407,90 @@ pub async fn type_text(
     )
     .await?;
 
-    // Focus
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
+    let object_id = prepare_text_target(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        timeout_ms,
+    )
+    .await?;
 
     if clear {
-        client
-            .send_command_typed::<_, Value>(
+        let cleared: EvaluateResult = client
+            .send_command_typed(
                 "Runtime.callFunctionOn",
                 &CallFunctionOnParams {
-                    function_declaration: r#"function() {
+                    function_declaration: r#"function(clearOnly) {
                         this.select && this.select();
                         this.value = '';
                         this.dispatchEvent(new Event('input', { bubbles: true }));
+                        if (clearOnly && ['INPUT', 'TEXTAREA'].includes(this.tagName)) {
+                            return this.isConnected && this.value === '';
+                        }
+                        return this.isConnected && this.getRootNode().activeElement === this;
                     }"#
                     .to_string(),
-                    object_id: Some(object_id),
-                    arguments: None,
+                    object_id: Some(object_id.clone()),
+                    arguments: Some(vec![CallArgument {
+                        value: Some(serde_json::json!(text.is_empty())),
+                        object_id: None,
+                    }]),
                     return_by_value: Some(true),
                     await_promise: Some(false),
                 },
                 Some(&effective_session_id),
             )
             .await?;
+        if cleared.result.value != Some(Value::Bool(true)) {
+            return Err(text_target_lost(selector_or_ref));
+        }
+        if text.is_empty() {
+            return Ok(());
+        }
     }
 
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    // For ordinary native text edits, preserve the actual caret/selection when
+    // calculating delivery. A focused field alone does not prove keys arrived.
+    let expected: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function(text) {
+                    if (!this.isConnected || this.getRootNode().activeElement !== this) {
+                        throw new Error('The text target lost focus before typing');
+                    }
+                    if (typeof this.value !== 'string' ||
+                        typeof this.selectionStart !== 'number' ||
+                        typeof this.selectionEnd !== 'number' || /[\r\n\t]/.test(text)) return null;
+                    return this.value.slice(0, this.selectionStart) + text + this.value.slice(this.selectionEnd);
+                }"#
+                .to_string(),
+                object_id: Some(object_id.clone()),
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(text)),
+                    object_id: None,
+                }]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+    if expected.exception_details.is_some() {
+        return Err(text_target_lost(selector_or_ref));
+    }
+    type_text_into_active_context(client, session_id, text, delay_ms).await?;
+    ensure_text_reached(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+        text,
+        expected.result.value.as_ref().and_then(Value::as_str),
+        false,
+    )
+    .await
 }
 
 pub async fn type_text_into_active_context(
@@ -258,7 +515,6 @@ pub async fn type_text_into_active_context(
                         text: text_str.clone(),
                         unmodified_text: text_str,
                         windows_virtual_key_code: Some(key_code),
-                        native_virtual_key_code: Some(key_code),
                         modifiers: None,
                     },
                     Some(session_id),
@@ -275,7 +531,6 @@ pub async fn type_text_into_active_context(
                         text: None,
                         unmodified_text: None,
                         windows_virtual_key_code: Some(key_code),
-                        native_virtual_key_code: Some(key_code),
                         modifiers: None,
                     },
                     Some(session_id),
@@ -342,7 +597,6 @@ pub async fn press_key_with_modifiers(
                 text: text.clone(),
                 unmodified_text: text.clone(),
                 windows_virtual_key_code: Some(key_code),
-                native_virtual_key_code: Some(key_code),
                 modifiers,
             },
             Some(session_id),
@@ -359,7 +613,6 @@ pub async fn press_key_with_modifiers(
                 text: None,
                 unmodified_text: None,
                 windows_virtual_key_code: Some(key_code),
-                native_virtual_key_code: Some(key_code),
                 modifiers,
             },
             Some(session_id),
@@ -514,7 +767,8 @@ pub async fn check(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Option<(f64, f64)>, String> {
+    let mut position = None;
     let is_checked = super::element::is_element_checked(
         client,
         session_id,
@@ -524,7 +778,7 @@ pub async fn check(
     )
     .await?;
     if !is_checked {
-        click(
+        let result = click_element(
             client,
             session_id,
             ref_map,
@@ -532,8 +786,10 @@ pub async fn check(
             "left",
             1,
             iframe_sessions,
+            false,
         )
         .await?;
+        position = Some(result.position);
 
         // Verify the click changed the state (Playwright parity: _setChecked re-checks).
         // If the coordinate-based click missed (e.g. hidden input, overlay), retry
@@ -557,7 +813,7 @@ pub async fn check(
             .await?;
         }
     }
-    Ok(())
+    Ok(position)
 }
 
 pub async fn uncheck(
@@ -566,7 +822,8 @@ pub async fn uncheck(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Option<(f64, f64)>, String> {
+    let mut position = None;
     let is_checked = super::element::is_element_checked(
         client,
         session_id,
@@ -576,7 +833,7 @@ pub async fn uncheck(
     )
     .await?;
     if is_checked {
-        click(
+        let result = click_element(
             client,
             session_id,
             ref_map,
@@ -584,8 +841,10 @@ pub async fn uncheck(
             "left",
             1,
             iframe_sessions,
+            false,
         )
         .await?;
+        position = Some(result.position);
 
         // Same verify-and-retry as check().
         if super::element::is_element_checked(
@@ -607,7 +866,7 @@ pub async fn uncheck(
             .await?;
         }
     }
-    Ok(())
+    Ok(position)
 }
 
 /// Fallback for when the coordinate-based CDP click did not toggle the
@@ -664,7 +923,7 @@ async fn js_click_checkbox(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: js.to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -697,7 +956,7 @@ pub async fn focus(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -736,7 +995,7 @@ pub async fn clear(
                     this.dispatchEvent(new Event('change', { bubbles: true }));
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -781,7 +1040,7 @@ pub async fn select_all(
                     }
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -816,7 +1075,7 @@ pub async fn scroll_into_view(
                 function_declaration:
                     "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }"
                         .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -861,7 +1120,7 @@ pub async fn dispatch_event(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration: js,
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -903,7 +1162,7 @@ pub async fn highlight(
                     }, 3000);
                 }"#
                 .to_string(),
-                object_id: Some(object_id),
+                object_id: Some(object_id.clone()),
                 arguments: None,
                 return_by_value: Some(true),
                 await_promise: Some(false),
@@ -928,6 +1187,7 @@ pub async fn tap_touch(
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        false,
     )
     .await?;
 
@@ -1039,8 +1299,12 @@ async fn dispatch_click(
     {
         // No button was pressed yet, nothing to release.
         return Ok(ClickResult {
+            position: (x, y),
             dialog_opened: true,
             pending_release: None,
+            x,
+            y,
+            button_pressed: false,
         });
     }
 
@@ -1073,6 +1337,7 @@ async fn dispatch_click(
         // release will never arrive on its own. Hand the caller what it needs
         // to release once the dialog is resolved.
         return Ok(ClickResult {
+            position: (x, y),
             dialog_opened: true,
             pending_release: Some(PendingRelease {
                 session_id: session_id.to_string(),
@@ -1080,6 +1345,9 @@ async fn dispatch_click(
                 y,
                 button: button.to_string(),
             }),
+            x,
+            y,
+            button_pressed: true,
         });
     }
 
@@ -1103,8 +1371,12 @@ async fn dispatch_click(
     )
     .await?;
     Ok(ClickResult {
+        position: (x, y),
         dialog_opened,
         pending_release: None,
+        x,
+        y,
+        button_pressed: true,
     })
 }
 
