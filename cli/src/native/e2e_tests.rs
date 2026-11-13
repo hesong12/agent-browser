@@ -7742,6 +7742,61 @@ async fn e2e_snapshot_continuous_static_text() {
     assert_success(&resp);
 }
 
+/// A background page can remain rendered while a dialog removes it from
+/// the accessibility tree. Scope errors report the active tree's scopes.
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_inaccessible_scope_reports_current_scopes() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<main id='background' aria-hidden='true'>",
+        "<h1>Search results</h1><button>Background action</button></main>",
+        "<section role='dialog' aria-modal='true' aria-label='Review details'>",
+        "<h2>Review details</h2><button>Confirm</button></section>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "snapshot", "selector": "#background", "interactive": false }),
+        &mut state,
+    )
+    .await;
+    let error = resp["error"].as_str().expect("background scope must fail");
+    assert!(error.contains("nothing accessible"), "{error}");
+    assert!(
+        error.contains("Current accessible scopes: dialog \"Review details\""),
+        "{error}"
+    );
+    assert!(!error.contains("Selectors seen"), "{error}");
+    assert!(!error.contains("Search results"), "{error}");
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "snapshot", "selector": "[role=dialog]", "interactive": false }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap();
+    assert!(snapshot.contains("Review details"), "{snapshot}");
+    assert!(snapshot.contains("Confirm"), "{snapshot}");
+    assert!(!snapshot.contains("Background action"), "{snapshot}");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 /// Test that a selector-scoped snapshot renders each element once when plain
 /// wrapper elements (ignored in the AX tree) sit between the matched element
 /// and its descendants.
