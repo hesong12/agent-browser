@@ -470,17 +470,45 @@ pub async fn take_snapshot(
 
         if roots.is_empty() {
             let selector = options.selector.as_deref().unwrap_or("");
-            return Err(selector_miss(
-                client,
-                None,
-                session_id,
-                format!(
-                    "Selector '{}' matched an element with nothing accessible in it",
-                    selector
-                ),
-                selector,
-            )
-            .await);
+            let mut message = format!(
+                "Selector '{}' matched an element with nothing accessible in it.",
+                selector
+            );
+            // A modal can leave the matched page in the DOM but outside the
+            // accessibility tree. Report the scopes that tree exposes now;
+            // DOM selector suggestions can point back at the inactive page.
+            let mut scopes = Vec::new();
+            for node in &tree_nodes {
+                if matches!(
+                    node.role.as_str(),
+                    "dialog"
+                        | "alertdialog"
+                        | "main"
+                        | "region"
+                        | "navigation"
+                        | "search"
+                        | "banner"
+                        | "complementary"
+                        | "contentinfo"
+                        | "form"
+                ) {
+                    let scope = if node.name.is_empty() {
+                        node.role.clone()
+                    } else {
+                        format!("{} {}", node.role, serde_json::json!(node.name))
+                    };
+                    if !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                }
+            }
+            if !scopes.is_empty() {
+                message.push_str(&format!(
+                    " Current accessible scopes: {}.",
+                    scopes.join("; ")
+                ));
+            }
+            return Err(message);
         }
         roots
     } else {
