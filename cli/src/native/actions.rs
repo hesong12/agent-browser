@@ -8847,6 +8847,9 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     let download_dir = download_dir
         .canonicalize()
         .map_err(|e| format!("Failed to resolve download directory: {}", e))?;
+    // On Windows canonicalize returns the \\?\ form, and Chrome cancels every
+    // download whose folder is spelled with it.
+    let download_dir = strip_verbatim_prefix(download_dir);
     let dest = download_dir.join(
         raw_dest
             .file_name()
@@ -12337,6 +12340,15 @@ async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<
     move_download(&saved, path_str).inspect_err(|_| state.downloads.release(&record.guid))
 }
 
+/// `\\?\C:\x` as `C:\x`; any other path unchanged.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 /// Returns the file Chrome saved for `guid` in `download_dir`.
 /// The GUID comes from a CDP event, so anything other than a single filename is rejected.
 fn guid_download_path(download_dir: &std::path::Path, guid: &str) -> Result<PathBuf, String> {
@@ -15825,6 +15837,14 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_windows_verbatim_download_folder_is_spelled_plainly() {
+        use std::path::PathBuf;
+        assert_eq!(super::strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\a\Downloads")), PathBuf::from(r"C:\Users\a\Downloads"));
+        assert_eq!(super::strip_verbatim_prefix(PathBuf::from("/tmp/x")), PathBuf::from("/tmp/x"));
+        assert_eq!(super::strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\host\share")), PathBuf::from(r"\\?\UNC\host\share"));
+    }
+
     /// Serves `Browser.getVersion` on one fixed `ws://` address for any number
     /// of connections and counts the calls.
     async fn version_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
