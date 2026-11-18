@@ -2653,6 +2653,12 @@ impl BrowserManager {
             Some(ref path) => {
                 json!({ "behavior": "allow", "downloadPath": path, "eventsEnabled": true })
             }
+            // A host that wants every download to be approved first turns the
+            // browser's own saving off; `download` still saves, to the file the
+            // caller names, and puts this back afterwards.
+            None if std::env::var_os("AGENT_BROWSER_DENY_DOWNLOADS").is_some() => {
+                json!({ "behavior": "deny", "eventsEnabled": true })
+            }
             None => json!({ "behavior": "default", "eventsEnabled": true }),
         };
         let _ = self
